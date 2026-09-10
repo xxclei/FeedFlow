@@ -10,7 +10,7 @@ type Config struct {
 	Server   ServerConfig   `yaml:"server"`
 	Database DatabaseConfig `yaml:"database"`
 	Redis    RedisConfig    `yaml:"redis"`
-	RabbitMQ RabbitMQConfig `yaml:"rabbitmQ "` //
+	RabbitMQ RabbitMQConfig `yaml:"rabbitmq"` //
 }
 
 type ServerConfig struct {
