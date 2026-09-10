@@ -1,0 +1,20 @@
+# 编译产物
+**/cmd/cmd
+*.exe
+bin/
+dist/
+
+# Go 测试与工具产物
+*.test
+*.out
+
+# 运行时产物
+.run/
+*.pid
+*.log
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

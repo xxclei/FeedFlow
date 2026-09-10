@@ -1,0 +1,12 @@
+# 编译产物
+cmd/cmd
+*.exe
+
+# 运行时产物
+.run/
+*.pid
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
