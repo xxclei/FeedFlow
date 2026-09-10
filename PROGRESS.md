@@ -23,6 +23,7 @@
 | 9 | RabbitMQ 与 Worker | [09](howto_feed-rebuild/09-RabbitMQ与Worker.md) | ⬜ 未开始 | 点赞秒回异步落库；停 MQ 直写兜底 |
 | 10 | Docker 部署 | [10](howto_feed-rebuild/10-Docker部署.md) | ⬜ 未开始 | `docker compose up -d --build` 全部起来 |
 | 11 | 前端（可选） | [11](howto_feed-rebuild/11-前端.md) | ⬜ 未开始 | 浏览器完整走一遍用户旅程 |
+| 12 | 私信与 SSE 实时通知 | [12](howto_feed-rebuild/12-私信与SSE实时通知.md) | ⬜ 未开始 | 两个账号互发私信；点赞触发实时通知 |
 
 ## 阶段 0 验收清单
 
