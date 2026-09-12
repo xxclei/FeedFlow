@@ -8,6 +8,7 @@ import (
 
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
+	"myfeed/internal/video"
 )
 
 // NewDB 拼 DSN 并建立连接，返回 GORM 句柄（内部是连接池）
@@ -25,7 +26,10 @@ func NewDB(cfg config.DatabaseConfig) (*gorm.DB, error) {
 
 // AutoMigrate 把结构体同步成真实的表
 func AutoMigrate(db *gorm.DB) error {
-	return db.AutoMigrate(&account.Account{})
+	return db.AutoMigrate(
+		&account.Account{},
+		&video.Video{}, &video.Tag{}, &video.VideoTag{}, &video.OutboxMsg{},
+	)
 }
 
 // CloseDB 关闭底层连接池

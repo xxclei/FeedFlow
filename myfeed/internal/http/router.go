@@ -5,6 +5,7 @@ import (
 
 	"myfeed/internal/account"
 	jwt "myfeed/internal/middleware/jwt"
+	"myfeed/internal/video"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
@@ -55,6 +56,31 @@ func SetRouter(db *gorm.DB) *gin.Engine {
 		protectedAccountGroup.POST("/updateProfile", accountHandler.UpdateProfile)
 	}
 	// getProfile 跨模块聚合接口：阶段6回填（依赖 video/social 的 repo 方法）
+
+	// ---------------- video ----------------
+	videoRepository := video.NewVideoRepository(db)
+	videoService := video.NewVideoService(videoRepository)
+	videoHandler := video.NewVideoHandler(videoService, accountService) // accountService 死依赖，对齐原项目
+	chunkHandler := video.NewChunkUploadHandler()                       // 阶段7回填：签名加 cache 参数
+
+	videoGroup := r.Group("/video")
+	{
+		// 公开接口
+		videoGroup.POST("/listByAuthorID", videoHandler.ListByAuthorID)
+		videoGroup.POST("/getDetail", videoHandler.GetDetail)
+	}
+	protectedVideoGroup := videoGroup.Group("")
+	protectedVideoGroup.Use(jwt.JWTAuth(accountRepository))
+	{
+		// 受保护接口：直传 + 分片上传
+		protectedVideoGroup.POST("/uploadVideo", videoHandler.UploadVideo)
+		protectedVideoGroup.POST("/uploadCover", videoHandler.UploadCover)
+		protectedVideoGroup.POST("/publish", videoHandler.PublishVideo)
+		protectedVideoGroup.POST("/chunk/init", chunkHandler.InitChunkUpload)
+		protectedVideoGroup.POST("/chunk/upload", chunkHandler.UploadChunk)
+		protectedVideoGroup.POST("/chunk/status", chunkHandler.ChunkStatus)
+		protectedVideoGroup.POST("/chunk/complete", chunkHandler.CompleteChunkUpload)
+	}
 
 	return r
 }
