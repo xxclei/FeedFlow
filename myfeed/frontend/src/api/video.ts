@@ -44,6 +44,21 @@ export function listByAuthorID(authorID: number) {
   return postJson<VideoItem[]>('/video/listByAuthorID', { author_id: authorID })
 }
 
+export function deleteVideo(id: number) {
+  return postJson<{ message: string }>('/video/delete', { id }, { authRequired: true })
+}
+
+// 后端返回的是绝对地址 http://localhost:8080/static/...，
+// 换成同源相对路径（经 vite 代理），播放/画布截帧都不受跨域影响
+export function staticURL(url: string): string {
+  try {
+    const u = new URL(url, window.location.origin)
+    return u.pathname
+  } catch {
+    return url
+  }
+}
+
 // ---------- 分片上传 ----------
 
 export interface InitChunkResult {

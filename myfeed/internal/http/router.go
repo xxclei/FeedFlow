@@ -76,6 +76,7 @@ func SetRouter(db *gorm.DB) *gin.Engine {
 		protectedVideoGroup.POST("/uploadVideo", videoHandler.UploadVideo)
 		protectedVideoGroup.POST("/uploadCover", videoHandler.UploadCover)
 		protectedVideoGroup.POST("/publish", videoHandler.PublishVideo)
+		protectedVideoGroup.POST("/delete", videoHandler.DeleteVideo) // 原项目漏挂载的路由，补上
 		protectedVideoGroup.POST("/chunk/init", chunkHandler.InitChunkUpload)
 		protectedVideoGroup.POST("/chunk/upload", chunkHandler.UploadChunk)
 		protectedVideoGroup.POST("/chunk/status", chunkHandler.ChunkStatus)

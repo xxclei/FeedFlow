@@ -38,3 +38,9 @@
 - 本机环境：Go 1.25 ✅ / Docker Desktop + WSL2 ✅（注意：Smart App Control 已关，否则拦编译产物）/ MySQL·Redis·RabbitMQ 容器 ✅ / npm 源已换 npmmirror
 - 阶段7回填点：chunk 会话迁 Redis、GetDetail 防击穿缓存、限流中间件、token 缓存快路径
 - 进阶实验清单：视频转码流水线（阶段9解锁，见任务#14）
+
+## 进阶实验待办（按解锁条件排序）
+
+1. **视频转码流水线**（阶段9解锁）：上传完成后发转码消息 → Worker 消费 → ffmpeg 多码率/抽帧/HLS 切片 → 回写 video 表（对齐 B站/YouTube 工业级）
+2. **Feed 推拉结合改造**（阶段9解锁）：全局时间线改造成"每用户收件箱 ZSET"；普通用户发布 fan-out 推送进粉丝收件箱，大V（粉丝超阈值）标记为 Pull 源；刷新 = 收件箱 + 实时查大V合并（微博/Twitter 同款方案）
+3. **对象存储 + CDN + 预签名直传**（阶段10后最合适）：视频/封面存 OSS/S3，数据库只存 URL；上传走服务端签发的预签名凭证直传对象存储，200MB 流量不再经过 API 进程；播放 URL 走 CDN 边缘节点 + 签名防盗链
