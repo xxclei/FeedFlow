@@ -3,9 +3,7 @@
 > 对照 `howto_feed-rebuild/README.md` 的复刻总路线图，完成一个阶段就把状态列改掉。
 > 规则：按顺序推进，每个阶段验收清单全过、`git commit` 之后才算完成。
 
-- 当前进度：**阶段 0~6 全部验收通过**（含本轮扩展：批量标签 / 批量删除 / 模糊检索），2026-09-13。
-  ⚠️ **但阶段 4/5/6 + 本轮扩展都还没提交** —— 工作区里堆着 63 个文件（38 改 + 25 新），横跨四个阶段。
-  按「验收全过 + commit 才算完成」的规矩，这几段还差最后一脚；而且现在没有干净的落点可回退。
+- 当前进度：**阶段 0~6 全部已提交**（含本轮扩展：批量标签 / 批量删除 / 模糊检索 / 播放页），提交 `e960d69`，2026-09-13。
 - 新项目代码：`myfeed/`（后端）+ `myfeed/frontend/`（Vue3 前端，随模块生长）
 - 参考答案：`origin-feed-project_example/feedsystem_video_go/`
 
@@ -17,9 +15,9 @@
 | 1 | 账号模块 | [01](howto_feed-rebuild/01-账号模块.md) | ✅ 2026-09-10 | Postman 走完注册→登录→带 token 访问 |
 | 2 | 视频模块 | [02](howto_feed-rebuild/02-视频模块.md) | ✅ 2026-09-12 | 直传/分片上传/发布事务/outbox；前端发布页可传可播 |
 | 3 | Feed 模块 | [03](howto_feed-rebuild/03-Feed模块.md) | ✅ 已验收（提交 `c57fa91`） | 三种游标翻页不重不漏；游客可刷流 |
-| 4 | 点赞模块 | [04](howto_feed-rebuild/04-点赞模块.md) | ✅ 已验收 · **⬜ 未提交** | 计数正确，重复点赞被拦截 |
-| 5 | 评论模块 | [05](howto_feed-rebuild/05-评论模块.md) | ✅ 已验收 · **⬜ 未提交** | 只有作者能删评论；@提及写 notifications 行 |
-| 6 | 关注模块 | [06](howto_feed-rebuild/06-关注模块.md) | ✅ 已验收 · **⬜ 未提交** | 关注后关注流出现对方视频 |
+| 4 | 点赞模块 | [04](howto_feed-rebuild/04-点赞模块.md) | ✅ 已验收（提交 `e960d69`） | 计数正确，重复点赞被拦截 |
+| 5 | 评论模块 | [05](howto_feed-rebuild/05-评论模块.md) | ✅ 已验收（提交 `e960d69`） | 只有作者能删评论；@提及写 notifications 行 |
+| 6 | 关注模块 | [06](howto_feed-rebuild/06-关注模块.md) | ✅ 已验收（提交 `e960d69`） | 关注后关注流出现对方视频 |
 | 7 | Redis 缓存 | [07](howto_feed-rebuild/07-Redis缓存.md) | ⬜ 未开始 | 停 Redis 业务不挂；redis-cli 能看到 key |
 | 8 | 热榜 | [08](howto_feed-rebuild/08-热榜.md) | ⬜ 未开始 | 翻页榜单不抖；停 Redis 降级 MySQL |
 | 9 | RabbitMQ 与 Worker | [09](howto_feed-rebuild/09-RabbitMQ与Worker.md) | ⬜ 未开始 | 点赞秒回异步落库；停 MQ 直写兜底 |
