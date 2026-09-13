@@ -9,14 +9,25 @@
   --canvas: #0f0f12;
   --surface: #17171c;
   --surface-2: #1d1d24;
+  --surface-3: #23232c;
   --ink: #f2f2f0;
   --ink-muted: #9b9ba6;
   --border: rgba(255, 255, 255, 0.08);
+  --border-strong: rgba(255, 255, 255, 0.16);
   --accent: #e8674a;
   --accent-hover: #f07b5f;
+  --accent-soft: rgba(232, 103, 74, 0.12);
+  --accent-line: rgba(232, 103, 74, 0.45);
   --ok: #4ab784;
   --danger: #e5534b;
   --shadow: 0 20px 48px rgba(0, 0, 0, 0.35);
+  --shadow-sm: 0 6px 18px rgba(0, 0, 0, 0.28);
+
+  /* 布局尺寸：两个壳共用，改一处两边都跟着变 */
+  --page-max: 1180px; /* 桌面内容区宽度（B 站是 1180 左右） */
+  --nav-h: 58px; /* 顶栏高 */
+  --channel-h: 46px; /* 桌面二级频道条高 */
+  --tabbar-h: 58px; /* 移动端底部 Tab 栏高（含安全区） */
 
   /* 字体：拉丁 Outfit / 中文回退系统栈 / 技术数据 JetBrains Mono */
   --font-sans: 'Outfit', 'Noto Sans SC', 'Microsoft YaHei', system-ui, sans-serif;
@@ -40,6 +51,11 @@ body {
   font-family: var(--font-sans);
   line-height: 1.6;
   -webkit-font-smoothing: antialiased;
+  /* 移动端横屏时不要自动放大字号 */
+  -webkit-text-size-adjust: 100%;
+  /* 关掉下拉刷新：它和 IntersectionObserver 无限滚动会互相打架
+     （桌面 Chrome 上这条无副作用，只是关掉一个没人用的手势） */
+  overscroll-behavior-y: none;
 }
 
 a {
@@ -49,6 +65,16 @@ a {
 }
 a:hover {
   color: var(--accent);
+}
+
+/* 去掉移动端 300ms 的双击缩放等待 */
+a,
+button,
+label,
+input,
+select,
+textarea {
+  touch-action: manipulation;
 }
 
 /* ---------- 通用组件 ---------- */
@@ -150,6 +176,122 @@ a:hover {
 .mono {
   font-family: var(--font-mono);
   font-size: 0.85em;
+}
+
+/* 行内代码（接口路径、字段名） */
+code {
+  font-family: var(--font-mono);
+  font-size: 0.86em;
+  padding: 1px 5px;
+  border-radius: 5px;
+  background: var(--surface-2);
+  color: var(--ink);
+}
+
+/* ---------- 两个壳共用的布局件 ---------- */
+
+/* 内容页通用容器：宽屏收拢到 --page-max。
+   注意它**不管内边距** —— 留白和「给底部 Tab 栏让位」是壳（layout）的职责，
+   在 .content 上做一次，所有视图（包括没套 .page 的表单页）就都有了。 */
+.page {
+  width: 100%;
+  max-width: var(--page-max);
+  margin: 0 auto;
+}
+
+/* 骨架屏微光：只动 transform，符合 DESIGN.md 的动效纪律 */
+.shimmer {
+  position: relative;
+  overflow: hidden;
+  background: var(--surface-2);
+}
+.shimmer::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  transform: translateX(-100%);
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.06), transparent);
+  animation: shimmer 1.4s infinite;
+}
+@keyframes shimmer {
+  to {
+    transform: translateX(100%);
+  }
+}
+
+/* 分段控件：移动端首页的「最新/点赞榜/热门榜」切换 */
+.seg {
+  display: flex;
+  gap: 4px;
+  padding: 4px;
+  border-radius: 12px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.seg::-webkit-scrollbar {
+  display: none;
+}
+.seg button {
+  flex: 0 0 auto;
+  min-height: 40px;
+  padding: 0 16px;
+  border: none;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--ink-muted);
+  font-family: inherit;
+  font-size: 0.9rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition:
+    color 0.2s var(--ease-out),
+    background 0.2s var(--ease-out);
+}
+.seg button:hover {
+  color: var(--ink);
+}
+.seg button.on {
+  background: var(--accent);
+  color: #fff;
+}
+
+/* 空态：图标 + 一句话 + 下一步动作 */
+.empty-block {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 44px 28px;
+  border: 1px dashed var(--border);
+  border-radius: 18px;
+  color: var(--ink-muted);
+}
+.empty-block .empty-title {
+  margin: 4px 0 0;
+  color: var(--ink);
+  font-weight: 600;
+  font-size: 1.02rem;
+}
+.empty-block .btn {
+  margin-top: 10px;
+}
+
+/* 错误条 */
+.alert {
+  margin: 0;
+  padding: 10px 14px;
+  border-radius: 12px;
+  border: 1px solid rgba(229, 83, 75, 0.4);
+  background: rgba(229, 83, 75, 0.08);
+  color: var(--danger);
+  font-size: 0.88rem;
+}
+
+/* 文案中的链接（赤陶色） */
+.link-accent {
+  color: var(--accent);
 }
 
 /* ---------- 动效 ---------- */

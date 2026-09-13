@@ -77,8 +77,8 @@ func (vh *VideoHandler) UploadVideo(c *gin.Context) {
 		return
 	}
 
-	const maxSize = 200 << 20 // 200MB
-	if f.Size <= 0 || f.Size > maxSize {
+	// 上限和分片 init 共用同一个常量（chunk_entity.go），改一处两边都跟着变
+	if f.Size <= 0 || f.Size > maxUploadSize {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid file size"})
 		return
 	}

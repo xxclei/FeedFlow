@@ -1,89 +1,29 @@
 <template>
-  <div class="app">
-    <nav class="nav rise">
-      <span class="brand">
-        <span class="brand-dot" aria-hidden="true"></span>
-        <span class="brand-name">myfeed</span>
-      </span>
-      <div class="nav-links">
-        <RouterLink to="/home">首页</RouterLink>
-        <template v-if="auth.isLoggedIn">
-          <RouterLink to="/video">视频</RouterLink>
-          <span class="who">
-            你好，<strong>{{ auth.claims?.username }}</strong>
-            <span class="mono">#{{ auth.claims?.account_id }}</span>
-          </span>
-          <button class="btn btn-ghost" @click="onLogout">登出</button>
-        </template>
-        <template v-else>
-          <RouterLink to="/login">登录</RouterLink>
-          <RouterLink to="/register">注册</RouterLink>
-        </template>
-      </div>
-    </nav>
-    <main class="main">
-      <RouterView />
-    </main>
-  </div>
+  <!--
+    App 只做两件事：
+      1. 按屏幕宽度挑一个壳。壳负责导航和版式，业务视图两端共用同一份
+         （差异下沉到 components/{desktop,mobile}/ 里的叶子组件和 CSS）。
+      2. 挂全局上传浮窗。它在 RouterView 外面，所以换页面不会打断上传。
+  -->
+  <DesktopShell v-if="isDesktop">
+    <RouterView />
+  </DesktopShell>
+  <MobileShell v-else>
+    <RouterView />
+  </MobileShell>
+
+  <UploadDock v-if="queue.hasActivity" />
 </template>
 
 <script setup lang="ts">
-import { RouterLink, RouterView, useRouter } from 'vue-router'
+import { RouterView } from 'vue-router'
 
-import { logout } from './api/account'
-import { useAuthStore } from './stores/auth'
+import UploadDock from './components/upload/UploadDock.vue'
+import DesktopShell from './layouts/DesktopShell.vue'
+import MobileShell from './layouts/MobileShell.vue'
+import { useDevice } from './composables/useDevice'
+import { useUploadQueueStore } from './stores/uploadQueue'
 
-const auth = useAuthStore()
-const router = useRouter()
-
-async function onLogout() {
-  try {
-    await logout()
-  } finally {
-    auth.clearTokens() // 无论后端结果如何，本地凭证都清掉
-    router.push('/login')
-  }
-}
+const { isDesktop } = useDevice()
+const queue = useUploadQueueStore()
 </script>
-
-<style scoped>
-.nav {
-  position: sticky;
-  top: 0;
-  z-index: 10;
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  max-width: 1080px;
-  margin: 0 auto;
-  padding: 14px 24px;
-  background: rgba(15, 15, 18, 0.82);
-  backdrop-filter: blur(12px);
-  border-bottom: 1px solid var(--border);
-}
-.brand {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  font-weight: 700;
-  letter-spacing: -0.02em;
-}
-.nav-links {
-  display: flex;
-  align-items: center;
-  gap: 20px;
-  font-size: 0.95rem;
-}
-.who {
-  color: var(--ink-muted);
-}
-.who strong {
-  color: var(--ink);
-}
-.main {
-  max-width: 1080px;
-  margin: 0 auto;
-  padding: 32px 24px;
-  min-height: calc(100dvh - 61px);
-}
-</style>

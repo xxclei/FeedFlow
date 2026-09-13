@@ -1,6 +1,49 @@
 package video
 
-const ChunkSize = 5 << 20 // 5 MB（前端默认分片大小）
+import "fmt"
+
+// 单文件上限。直传（video_handler.go）和分片 init 两条路径**共用同一个值**，
+// 改一处两边都跟着变，不会出现"直传放行 500MB 而分片卡 200MB"这种漂移。
+const maxUploadSize = 500 << 20 // 500 MB
+
+// ChunkSize 分片大小的最小档，也是老前端的固定值。
+// 阶段7 起前端按文件大小分档（5/10/20MB），服务端**照单全收**客户端在 init 里
+// 声明的 chunk_size —— 落盘偏移、每片长度、位图大小全部由它推导，所以这里不再假设一个固定值。
+const ChunkSize = 5 << 20 // 5 MB
+
+// 分片几何的上下界。不是用来限制用户的，是用来挡住畸形请求：
+//   - 下界：chunk_size=1 配 500MB 文件 → total_chunks = 5 亿 → make([]bool, 5e8) 一口气吃 500MB 内存
+//   - 上界：total_chunks 直接决定位图大小，必须有个硬顶
+const (
+	minChunkSize   = 1 << 20
+	maxTotalChunks = 4096
+)
+
+// validateChunkPlan 校验分片几何自洽：total_chunks 必须正好等于 ceil(file_size / chunk_size)。
+//
+// 为什么现在是必需的：chunk_size 从"固定 5MB"变成"客户端按档位算出来的可变值"之后，
+// 偏移、每片长度、位图大小全由它推导，一个前后矛盾的组合就会把文件写歪
+// （chunk_size=1MB 却声明 total_chunks=1，写完只有前 1MB 是有内容的）。
+// 以前靠"merge 时按序拼"掩盖了这类错误，现在必须显式挡住。
+func validateChunkPlan(fileSize, chunkSize int64, totalChunks int) error {
+	if chunkSize < minChunkSize {
+		return fmt.Errorf("chunk_size too small (min %d bytes)", minChunkSize)
+	}
+	if chunkSize > maxUploadSize {
+		return fmt.Errorf("chunk_size too large (max %d bytes)", maxUploadSize)
+	}
+	if totalChunks > maxTotalChunks {
+		return fmt.Errorf("total_chunks too large (max %d)", maxTotalChunks)
+	}
+	// 用除法算期望片数而不是拿乘法比大小：乘法在 fileSize 逼近 int64 上限时会溢出。
+	// 两个入参各自有上界，所以这里的加法不会溢出
+	want := int((fileSize + chunkSize - 1) / chunkSize)
+	if totalChunks != want {
+		return fmt.Errorf("total_chunks mismatch: got %d, want %d (%d bytes / %d per chunk)",
+			totalChunks, want, fileSize, chunkSize)
+	}
+	return nil
+}
 
 // ChunkUploadSession 一次分片上传的全部状态。
 // 阶段2 存在内存 map 里；阶段7 整体迁到 Redis（结构不变，只换存储引擎）
@@ -11,8 +54,26 @@ type ChunkUploadSession struct {
 	FileSize     int64  `json:"file_size"`
 	ChunkSize    int64  `json:"chunk_size"`
 	TotalChunks  int    `json:"total_chunks"`
-	FileHash     string `json:"file_hash"`      // 整个文件的 MD5（前端算好带来的，断点续传的索引）
-	UploadedBits []bool `json:"uploaded_bits"`  // 位图：第 i 片是否已传
+	FileHash     string `json:"file_hash"`     // 整个文件的 MD5（前端算好带来的，断点续传的索引）
+	UploadedBits []bool `json:"uploaded_bits"` // 位图：第 i 片是否已传
+
+	// 下面两个在 init 时就定下来，不再等 complete 才生成：
+	// 分片是按偏移**直接写进最终文件**的，必须先有一个确定的归宿。
+	// 实际写的是 FinalPath + ".part"，complete 时才改名成 .mp4 ——
+	// 上传期间不产生"可被访问到的半成品 mp4"，也就不需要临时分片目录。
+	FinalPath string `json:"-"`
+	URLPath   string `json:"-"` // /static/videos/<账号>/<日期>/<随机>.mp4
+}
+
+// partPath 落盘中的半成品路径
+func (s *ChunkUploadSession) partPath() string { return s.FinalPath + ".part" }
+
+// chunkLen 第 index 片应该有多少字节（最后一片可能不满）
+func (s *ChunkUploadSession) chunkLen(index int) int64 {
+	if index == s.TotalChunks-1 {
+		return s.FileSize - int64(index)*s.ChunkSize
+	}
+	return s.ChunkSize
 }
 
 // UploadedChunks 已传分片的下标列表（断点续传时告诉前端"只补这些之外的"）

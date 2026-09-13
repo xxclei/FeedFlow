@@ -4,6 +4,7 @@ import (
 	"log"
 
 	"myfeed/internal/account"
+	"myfeed/internal/feed"
 	jwt "myfeed/internal/middleware/jwt"
 	"myfeed/internal/video"
 
@@ -82,6 +83,29 @@ func SetRouter(db *gorm.DB) *gin.Engine {
 		protectedVideoGroup.POST("/chunk/status", chunkHandler.ChunkStatus)
 		protectedVideoGroup.POST("/chunk/complete", chunkHandler.CompleteChunkUpload)
 	}
+
+	// ---------------- feed ----------------
+	// feed 不拥有任何表：它只读 videos/tags，所以这里没有 AutoMigrate 相关的东西
+	feedRepository := feed.NewFeedRepository(db)
+	feedService := feed.NewFeedService(feedRepository) // 阶段4回填：加 likeRepository；阶段7回填：加 cache
+	feedHandler := feed.NewFeedHandler(feedService)
+
+	feedGroup := r.Group("/feed")
+	// 注意是 SoftJWTAuth：游客也要能刷流。
+	// 它和 JWTAuth 的区别只在"没 token 时"——JWTAuth 直接 401 掐断，
+	// SoftJWTAuth 放行并把 viewerAccountID 留空（handler 里降级成 0）
+	feedGroup.Use(jwt.SoftJWTAuth(accountRepository))
+	{
+		feedGroup.POST("/listLatest", feedHandler.ListLatest)
+		feedGroup.POST("/listLikesCount", feedHandler.ListLikesCount)
+		feedGroup.POST("/listByPopularity", feedHandler.ListByPopularity)
+		feedGroup.POST("/listByTag", feedHandler.ListByTag)
+	}
+	// 阶段6回填：关注流必须登录（"我关注的人"得有"我"），
+	// 所以它挂在同一个组的强鉴权子组上：
+	//   protectedFeedGroup := feedGroup.Group("")
+	//   protectedFeedGroup.Use(jwt.JWTAuth(accountRepository))
+	//   protectedFeedGroup.POST("/listByFollowing", feedHandler.ListByFollowing)
 
 	return r
 }

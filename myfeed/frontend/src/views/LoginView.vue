@@ -40,7 +40,7 @@ async function onSubmit() {
   try {
     const data = await login(username.value, password.value)
     auth.setTokens(data.token, data.refresh_token)
-    router.push('/home')
+    router.push('/feed')
   } catch (e) {
     error.value = e instanceof Error ? e.message : '登录失败'
   } finally {
@@ -73,5 +73,12 @@ form {
 .tip {
   margin: 0;
   font-size: 0.9rem;
+}
+@media (max-width: 767px) {
+  .auth {
+    margin-top: 12px;
+    border-radius: 18px;
+    padding: 22px;
+  }
 }
 </style>

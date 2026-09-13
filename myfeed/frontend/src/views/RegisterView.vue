@@ -75,4 +75,11 @@ form {
   margin: 0;
   font-size: 0.9rem;
 }
+@media (max-width: 767px) {
+  .auth {
+    margin-top: 12px;
+    border-radius: 18px;
+    padding: 22px;
+  }
+}
 </style>

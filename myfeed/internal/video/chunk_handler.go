@@ -109,7 +109,8 @@ func NewChunkUploadHandler() *ChunkUploadHandler {
 	return &ChunkUploadHandler{store: newChunkSessionStore()}
 }
 
-// InitChunkUpload ① 开会话：查断点续传索引 → 有就接着传，没有就新建
+// InitChunkUpload ① 开会话：查断点续传索引 → 有就接着传，没有就新建。
+// 新建时顺带把最终文件和 .part 半成品都预分配好，后续分片直接往偏移上写
 func (h *ChunkUploadHandler) InitChunkUpload(c *gin.Context) {
 	var req InitChunkUploadRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -123,18 +124,45 @@ func (h *ChunkUploadHandler) InitChunkUpload(c *gin.Context) {
 		return
 	}
 
-	const maxSize = 200 << 20 // 和直传一致的 200MB 上限
-	if req.FileSize > maxSize {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "file size exceeds 200MB limit"})
+	if req.FileSize > maxUploadSize {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "file size exceeds 500MB limit"})
+		return
+	}
+	if err := validateChunkPlan(req.FileSize, req.ChunkSize, req.TotalChunks); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
 	// 断点续传：同账号同 file_hash 的会话还活着 → 直接续（RefreshTTL 阶段7回填）
 	if session, ok := h.store.getByHash(accountID, req.FileHash); ok {
-		c.JSON(http.StatusOK, gin.H{
-			"upload_id":       session.UploadID,
-			"uploaded_chunks": session.UploadedChunks(),
-		})
+		// 分片几何必须完全一致才能续：磁盘上已写的分片是按**旧** chunk_size 落的偏移，
+		// 档位一变就对不上了（前端改分档规则后重传同一个文件正好会走到这里）。
+		// 与其返回错误把这个文件钉死，不如丢掉旧会话重开一个 —— 分片本来就要重传。
+		if session.FileSize == req.FileSize &&
+			session.ChunkSize == req.ChunkSize &&
+			session.TotalChunks == req.TotalChunks {
+			c.JSON(http.StatusOK, gin.H{
+				"upload_id":       session.UploadID,
+				"uploaded_chunks": session.UploadedChunks(),
+			})
+			return
+		}
+		h.discard(session)
+	}
+
+	// 输出路径在 init 就定下来：分片直接按偏移写进最终文件，必须先有归宿。
+	// 目录结构和直传保持一致（videos/<作者ID>/<日期>/），避免单目录塞几十万文件
+	date := time.Now().Format("20060102")
+	relDir := filepath.Join("videos", fmt.Sprintf("%d", accountID), date)
+	absDir := filepath.Join(".run", "uploads", relDir)
+	if err := os.MkdirAll(absDir, 0o755); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create output dir"})
+		return
+	}
+
+	filename, err := randHex(16)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate filename"})
 		return
 	}
 
@@ -149,13 +177,40 @@ func (h *ChunkUploadHandler) InitChunkUpload(c *gin.Context) {
 		TotalChunks:  req.TotalChunks,
 		FileHash:     req.FileHash,
 		UploadedBits: make([]bool, req.TotalChunks), // 位图：全 false 起步
+		FinalPath:    filepath.Join(absDir, filename+".mp4"),
+		URLPath:      fmt.Sprintf("/static/videos/%d/%s/%s.mp4", accountID, date, filename),
 	}
+
+	// 预先把文件撑到最终大小（Truncate 只移动 EOF，不写零，所以不费 IO）。
+	// 之后每片按 index*chunk_size 直接写到自己的位置上，complete 那一步就没有"合并"了
+	if err := preallocate(session.partPath(), req.FileSize); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create upload file"})
+		return
+	}
+
 	h.store.put(session)
 
 	c.JSON(http.StatusOK, gin.H{
 		"upload_id":       uploadID,
 		"uploaded_chunks": []int{},
 	})
+}
+
+// discard 丢掉一个不能再用的会话：断点续传索引、位图、半成品文件一起清。
+// 不丢的话，半成品 .part 会永远留在磁盘上（完不成的会话没人再来收尾）
+func (h *ChunkUploadHandler) discard(s ChunkUploadSession) {
+	h.store.remove(s.UploadID)
+	_ = os.Remove(s.partPath())
+}
+
+// preallocate 建好文件并把长度定死在 size
+func preallocate(path string, size int64) error {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return f.Truncate(size)
 }
 
 // UploadChunk ② 收一片：验身份 → 验下标 → 幂等检查 → MD5校验 → 落盘 → 记位图
@@ -199,6 +254,18 @@ func (h *ChunkUploadHandler) UploadChunk(c *gin.Context) {
 		return
 	}
 
+	// 这一片该有多少字节。客户端分片几何算错的话在这里就挡住，
+	// 不必等到写歪文件、拉长成"视频能播但中间一段是花的"再回头查
+	wantLen := session.chunkLen(req.ChunkIndex)
+	if f.Size != wantLen {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "chunk size mismatch",
+			"want":  wantLen,
+			"got":   f.Size,
+		})
+		return
+	}
+
 	chunkFile, err := f.Open()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read chunk"})
@@ -206,7 +273,7 @@ func (h *ChunkUploadHandler) UploadChunk(c *gin.Context) {
 	}
 	defer chunkFile.Close()
 
-	// 逐字节喂给 MD5（不整读进内存——分片最大 5MB，但这个习惯对大流很重要）
+	// 逐字节喂给 MD5（不整读进内存——分片最大 20MB，但这个习惯对大流很重要）
 	hash := md5.New()
 	if _, err := io.Copy(hash, chunkFile); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to hash chunk"})
@@ -220,28 +287,34 @@ func (h *ChunkUploadHandler) UploadChunk(c *gin.Context) {
 		return
 	}
 
-	// 分片先落 tmp/<uploadID>/<index>，全部到齐后才合并
-	tmpDir := filepath.Join(".run", "uploads", "tmp", req.UploadID)
-	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create temp dir"})
-		return
-	}
-
-	chunkPath := filepath.Join(tmpDir, fmt.Sprintf("%d", req.ChunkIndex))
 	if _, seekErr := chunkFile.Seek(0, io.SeekStart); seekErr != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read chunk"})
 		return
 	}
 
-	dst, err := os.Create(chunkPath)
+	// 直接写到最终文件的偏移上：index 决定落点，所以乱序到达、多片并发都无所谓。
+	//
+	// 每次 open 自己的 fd，而不是把 fd 挂在会话上：会话可能在 map 里躺 24 小时，
+	// 常驻 fd 就是泄漏。多个 fd 各自 WriteAt 到不同偏移是安全的 ——
+	// WriteAt 不带共享的文件位置指针（对应 pwrite），不存在互相踩 offset 的问题。
+	dst, err := os.OpenFile(session.partPath(), os.O_WRONLY, 0o644)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save chunk"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to open target file"})
 		return
 	}
 	defer dst.Close()
 
-	if _, err := io.Copy(dst, chunkFile); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save chunk"})
+	// NewOffsetWriter 把「从 offset 开始顺序写」包装成普通 Write，
+	// 于是能直接 io.Copy 流式落盘，不用把整片读进内存
+	ow := io.NewOffsetWriter(dst, int64(req.ChunkIndex)*session.ChunkSize)
+	n, err := io.Copy(ow, chunkFile)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to write chunk"})
+		return
+	}
+	if n != wantLen {
+		// MD5 都对上了还写不满 → 是磁盘/环境的问题，不是客户端的问题，值得重试（返回 5xx）
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "short write"})
 		return
 	}
 
@@ -284,7 +357,8 @@ func (h *ChunkUploadHandler) ChunkStatus(c *gin.Context) {
 	})
 }
 
-// CompleteChunkUpload ④ 合并：全到齐 → 按 index 升序拼成 mp4 → 清理现场
+// CompleteChunkUpload ④ 收尾：全到齐 → 把 .part 改名成 .mp4 → 销毁会话。
+// 没有"合并"这一步——分片早就写到自己该在的偏移上了
 func (h *ChunkUploadHandler) CompleteChunkUpload(c *gin.Context) {
 	var req CompleteChunkUploadRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -328,56 +402,28 @@ func (h *ChunkUploadHandler) CompleteChunkUpload(c *gin.Context) {
 		return
 	}
 
-	date := time.Now().Format("20060102")
-	relDir := filepath.Join("videos", fmt.Sprintf("%d", accountID), date)
-	root := filepath.Join(".run", "uploads")
-	absDir := filepath.Join(root, relDir)
-	if err := os.MkdirAll(absDir, 0o755); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create output dir"})
+	partPath := session.partPath()
+
+	// init 时已经 Truncate 到最终大小，所以 file_size 是构造上就成立的；
+	// 这里 Stat 只是确认文件还在 —— 被外部删掉时要给出带 "missing" 的错误，
+	// 前端才认得出来该走「加盐重开会话」的逃生舱（见 utils/chunkUploader.ts 的 isPoisoned）
+	if _, err := os.Stat(partPath); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "chunk file missing"})
 		return
 	}
 
-	filename, err := randHex(16)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate filename"})
-		return
-	}
-	finalPath := filepath.Join(absDir, filename+".mp4")
-
-	finalFile, err := os.Create(finalPath)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create final file"})
+	// 预分配 + 偏移直写之后，「合并」就只剩一次改名：
+	// 没有一次全量拷贝（老实现是读 500MB 再写 500MB），也没有中间目录要清。
+	// 同目录内 rename 是原子的 —— 要么看到完整的 .mp4，要么什么都没有，不存在半成品
+	if err := os.Rename(partPath, session.FinalPath); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to finalize file"})
 		return
 	}
 
-	// 按 index 升序逐片拼入（分片乱序到达也没关系，index 决定顺序）
-	tmpDir := filepath.Join(".run", "uploads", "tmp", req.UploadID)
-	for i := 0; i < session.TotalChunks; i++ {
-		chunkPath := filepath.Join(tmpDir, fmt.Sprintf("%d", i))
-		cf, err := os.Open(chunkPath)
-		if err != nil {
-			finalFile.Close()
-			os.Remove(finalPath) // 合并失败绝不留半成品
-			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("chunk %d missing", i)})
-			return
-		}
-		_, err = io.Copy(finalFile, cf)
-		cf.Close()
-		if err != nil {
-			finalFile.Close()
-			os.Remove(finalPath)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to merge chunks"})
-			return
-		}
-	}
-	finalFile.Close()
-
-	// 清理三件套：临时分片目录、会话、断点续传索引
-	_ = os.RemoveAll(tmpDir)
+	// 清理两件套：会话、断点续传索引（分片目录已经不存在了）
 	h.store.remove(req.UploadID)
 
-	urlPath := fmt.Sprintf("/static/videos/%d/%s/%s.mp4", accountID, date, filename)
-	playURL := buildAbsoluteURL(c, urlPath)
+	playURL := buildAbsoluteURL(c, session.URLPath)
 
 	c.JSON(http.StatusOK, gin.H{
 		"url":      playURL,

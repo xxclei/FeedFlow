@@ -1,10 +1,21 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>frontend</title>
+    <!--
+      viewport-fit=cover：没有它 env(safe-area-inset-*) 恒为 0，底部 Tab 栏会被
+        iPhone 的 home indicator 压住。
+      interactive-widget=resizes-content：安卓软键盘弹起时把视口压小，
+        否则键盘直接盖在投稿表单上。
+      不加 maximum-scale / user-scalable=no —— 那是无障碍倒退。
+    -->
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content"
+    />
+    <meta name="theme-color" content="#0f0f12" />
+    <title>myfeed</title>
   </head>
   <body>
     <div id="app"></div>

@@ -15,10 +15,11 @@
     <div class="card rise">
       <h3>接下来这里会长出什么</h3>
       <ul class="roadmap">
-        <li><span class="phase">阶段 2</span>视频上传与发布</li>
-        <li><span class="phase">阶段 3</span>Feed 滑动流</li>
+        <li class="done"><span class="phase">阶段 2</span>视频上传与发布</li>
+        <li class="done"><span class="phase">阶段 3</span>Feed 游标滑动流 —— <RouterLink to="/feed">去看看</RouterLink></li>
         <li><span class="phase">阶段 4/5</span>点赞与评论</li>
-        <li><span class="phase">阶段 8</span>热榜</li>
+        <li><span class="phase">阶段 6</span>关注流与个人主页</li>
+        <li><span class="phase">阶段 8</span>热门榜 Redis 快照</li>
         <li><span class="phase">阶段 9+</span>实时通知</li>
       </ul>
     </div>
@@ -83,5 +84,23 @@ h3 {
   font-family: var(--font-mono);
   font-size: 0.8rem;
   color: var(--accent);
+}
+.roadmap li.done {
+  border-color: rgba(74, 183, 132, 0.35);
+}
+.roadmap li.done .phase {
+  color: var(--ok);
+}
+.roadmap a {
+  color: var(--accent);
+}
+@media (max-width: 767px) {
+  .card {
+    border-radius: 18px;
+    padding: 20px;
+  }
+  h2 {
+    font-size: 1.05rem;
+  }
 }
 </style>
