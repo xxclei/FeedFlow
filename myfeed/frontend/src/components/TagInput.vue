@@ -32,9 +32,13 @@
 
 <script setup lang="ts">
 import { computed, ref } from 'vue'
+import { TAG_RE, extractTags } from '../utils/tags'
 
-// 和后端 ExtractTags 完全一致的规则：#后跟任意语言字母/数字/下划线
-const TAG_RE = /#([\p{L}\p{N}_]+)/gu
+// 本组件原本自带一份 TAG_RE 的副本，本轮收敛到 utils/tags.ts 里唯一的那一份。
+// 注意：**这个正则带 g 标志，是"有状态"的**（lastIndex 会被 retain），
+// 所以不能拿同一个正则对象交替跑 matchAll 和 test ——
+// utils/tags.ts 里的 extractTags 每次调用都从 matchAll 重新开始，是安全的。
+// 这里的 highlighted 用的 replace 也是从头扫的，同样安全。
 
 const props = defineProps<{
   modelValue: string
@@ -58,17 +62,9 @@ const highlighted = computed(() =>
   ),
 )
 
-const tags = computed(() => {
-  const seen = new Set<string>()
-  const out: string[] = []
-  for (const m of props.modelValue.matchAll(TAG_RE)) {
-    if (!seen.has(m[1])) {
-      seen.add(m[1])
-      out.push(m[1])
-    }
-  }
-  return out
-})
+// 下面这排 chip 是"用户写下的 #标签会被落库成什么"的预览，
+// 所以直接用 extractTags（和后端 ExtractTags 同一套规则），不再自己遍历一遍
+const tags = computed(() => extractTags(props.modelValue))
 
 function onInput(e: Event) {
   emit('update:modelValue', (e.target as HTMLInputElement).value)

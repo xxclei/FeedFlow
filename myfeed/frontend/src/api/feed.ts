@@ -1,6 +1,10 @@
 // Feed 模块 API。
-// 三个流 + 一个标签流，全部匿名可访问（后端挂的是 SoftJWTAuth：有 token 就识别身份，
-// 没有也放行）。注意这里都不传 authRequired——这正是"游客能刷流"的前端体现。
+// 四个流（最新/点赞榜/热门榜/关注）+ 一个标签流。
+//
+// **前四个里只有「关注」需要登录**：/feed 整组挂的是 SoftJWTAuth（有 token 就识别身份，
+// 没有也放行），而 /feed/listByFollowing 额外叠了一层 JWTAuth ——
+// 因为"我关注的人"必须先有"我"。所以这一个传 authRequired: true，其余都不传，
+// 这正是"游客能刷流、但不能看关注流"的前端体现。
 
 import { postJson } from './client'
 
@@ -18,7 +22,7 @@ export interface FeedVideoItem {
   cover_url: string
   create_time: number // Unix 秒（后端 .Unix()）
   likes_count: number
-  is_liked: boolean // 阶段4回填，当前恒 false
+  is_liked: boolean // 阶段4已接入：登录用户是真值；游客恒 false（后端拿不到"我"是谁）
 }
 
 // ---- 最新流：单值游标（毫秒） ----
@@ -90,6 +94,34 @@ export function listByPopularity(input: {
     body.latest_id_before = input.latest_id_before
   }
   return postJson<ListByPopularityResponse>('/feed/listByPopularity', body)
+}
+
+// ---- 关注流（阶段6）：唯一一条必须登录的 ----
+
+export interface ListByFollowingResponse {
+  video_list: FeedVideoItem[]
+  next_time: number // 毫秒，和 listLatest 同一套
+  has_more: boolean
+}
+
+/**
+ * 我关注的人发的最新视频。
+ *
+ * **必须登录**（authRequired: true），这是 /feed 下唯一一条 ——
+ * router.go 里它挂在一个额外的空路径子组上，那个子组又叠了一层 JWTAuth。
+ *
+ * 游客**不要发这个请求**。不是因为浪费：client.ts 的 handleResponse
+ * 对**任何** 401 都会 auth.clearTokens()，游客打一次就把本地残留的、
+ * 已经过期的 token 状态搅一遍。界面上（FeedView 的分段控件、桌面频道条）
+ * 已经按登录状态把它藏起来了，这里是第二道。
+ *
+ * 游标单位是**毫秒**，和 listLatest 完全一致 —— 后端刻意改的（原项目这里是秒），
+ * 为的就是这两条流能共用 useFeedStream 里同一段游标代码，不用记两个单位。
+ */
+export function listByFollowing(input: { limit: number; latest_time: number }) {
+  return postJson<ListByFollowingResponse>('/feed/listByFollowing', input, {
+    authRequired: true,
+  })
 }
 
 // ---- 标签流：本阶段无游标，只取最新 N 条 ----

@@ -60,12 +60,19 @@
 
         <ActionBar
           :likes-count="video.likes_count"
+          :is-liked="isLiked"
+          :liking="likeBusy"
           :is-owner="isOwner"
           :deleting="deleting"
+          @toggle-like="onToggleLike"
           @delete="onDelete"
         />
 
-        <p v-if="notice" class="alert">{{ notice }}</p>
+        <!-- notice 既放删除/点赞的失败，也放"请先登录"。游客点点赞时给的是这里 -->
+        <p v-if="notice" class="alert">
+          {{ notice }}
+          <RouterLink v-if="needLogin" class="alert-link" to="/login">去登录</RouterLink>
+        </p>
 
         <div v-if="tags.length" class="tags">
           <RouterLink v-for="t in tags" :key="t" class="tag" :to="`/tag/${t}`">#{{ t }}</RouterLink>
@@ -73,15 +80,11 @@
 
         <p v-if="video.description" class="desc">{{ video.description }}</p>
 
-        <!-- 评论区占位。摆出来但明确标注未接入 —— B 站式详情页不能只有播放器 -->
-        <section class="card comments">
-          <h2>评论 <span class="soon">阶段5</span></h2>
-          <textarea class="cinput" rows="3" disabled placeholder="评论功能要等 comment 模块"></textarea>
-          <button class="btn" type="button" aria-disabled="true" @click="noop">发布</button>
-          <p class="note text-muted">
-            阶段5接入（依赖 comment 模块，后端还没注册路由）。现在只有 video_tags 那条线是通的。
-          </p>
-        </section>
+        <!-- 评论区（阶段5）。
+             :key 绑 video.id —— 从相关推荐跳到另一条视频时视图是**复用**的，
+             不重建的话新视频会先带着上一条的评论列表闪一下，然后才被替换掉。
+             和播放器那边 :key="video.play_url" 是同一个理由 -->
+        <CommentSection :key="video.id" :video-id="video.id" />
       </div>
 
       <aside class="side">
@@ -99,10 +102,12 @@ import { RouterLink, useRoute, useRouter } from 'vue-router'
 import VideoPlayer from '../components/player/VideoPlayer.vue'
 import ActionBar from '../components/video/ActionBar.vue'
 import AuthorCard from '../components/video/AuthorCard.vue'
+import CommentSection from '../components/video/CommentSection.vue'
 import RelatedList from '../components/video/RelatedList.vue'
 import { findByID, type AccountInfo } from '../api/account'
 import { ApiError } from '../api/client'
 import { listByTag, type FeedVideoItem } from '../api/feed'
+import { isLiked as fetchIsLiked, likeVideo, unlikeVideo } from '../api/like'
 import { deleteVideo, getDetail, listByAuthorID, normalizeVideo } from '../api/video'
 import { useDevice } from '../composables/useDevice'
 import { useAuthStore } from '../stores/auth'
@@ -133,6 +138,12 @@ const relatedTitle = ref('相关推荐')
 const relatedLoading = ref(false)
 const deleting = ref(false)
 const notice = ref('')
+const needLogin = ref(false) // notice 是不是"请先登录"（决定要不要配一个登录链接）
+
+// 点赞状态。**不在 FeedVideoItem 里**：/video/getDetail 返回的是 videos 表那一行，
+// 而"我赞过没有"是 likes 表和"我"的交叉信息，videos 表存不了，得单独问一次后端。
+const isLiked = ref(false)
+const likeBusy = ref(false)
 
 const tags = computed(() =>
   video.value ? extractTags(video.value.title, video.value.description) : [],
@@ -145,10 +156,14 @@ async function load() {
   invalidID.value = false
   error.value = ''
   notice.value = ''
+  needLogin.value = false
   video.value = null
   author.value = null
   related.value = []
   relatedTitle.value = '相关推荐'
+  // 必须清空：从 /video/1 点到 /video/2 时**视图是被复用的**，
+  // 不清的话新视频会先带着上一条的"已赞"状态闪一下
+  isLiked.value = false
 
   // route.params.id 是**字符串**。原样塞进 JSON 发给后端的话，`ID uint` 反序列化就失败，
   // ShouldBindJSON 报错 → 归类成 500（不是 404），页面上会挂一条 Go 的英文报错。
@@ -172,7 +187,113 @@ async function load() {
     loading.value = false
   }
 
-  if (video.value) void loadSide()
+  if (video.value) {
+    void loadSide()
+    void loadLikeState(id)
+  }
+}
+
+/**
+ * 单独问一次"我赞过这个视频吗"。
+ *
+ * 游客**不发**这个请求：/like/* 挂的是 JWTAuth（不是 /feed 的 SoftJWTAuth），
+ * 没 token 必然 401，而 client.ts 对任何 401 都会 clearTokens。
+ * 游客本来就没 token，白跑一趟还平白多一次失败请求。
+ */
+async function loadLikeState(id: number) {
+  if (!auth.isLoggedIn) {
+    isLiked.value = false
+    return
+  }
+  try {
+    const res = await fetchIsLiked(id)
+    // 快速连点相关推荐时上一轮可能后到 —— 认领结果前先确认还停在同一个视频上
+    if (video.value?.id !== id) return
+    isLiked.value = res.is_liked
+  } catch {
+    // 只读接口失败不该让整页报错：保持 false，用户点一下自然会知道真相
+    // （那时 /like/like 会给出真正的错误）。这里不设 notice，也不打断播放。
+    isLiked.value = false
+  }
+}
+
+/**
+ * 点赞 / 取消点赞。
+ *
+ * **乐观更新**：先改界面，再发请求。点赞是高频、低风险、结果几乎必然成功的动作，
+ * 等一次往返（局域网 5ms、线上可能 200ms）才变色，会让每次点击都像卡了一下。
+ * 代价是"猜错了必须能退回去"——所以下面**每一个**失败分支都先 rollback()。
+ *
+ * 这里也是"点赞状态归父组件所有"的体现：ActionBar 只报事件，
+ * 计数和 isLiked 的真相都在这一个地方。
+ */
+async function onToggleLike() {
+  const v = video.value
+  if (!v || likeBusy.value) return
+
+  // 游客：不跳走，就地给一句话 + 一个登录入口。
+  // 正在看的视频可能已经播到一半，为了点赞把人踢到登录页是破坏性的。
+  if (!auth.isLoggedIn) {
+    notice.value = '登录后才能点赞。'
+    needLogin.value = true
+    return
+  }
+
+  const prevLiked = isLiked.value
+  const prevCount = v.likes_count
+
+  // 乐观更新。Math.max(0, ...) 是兜底：后端计数有 GREATEST(x-1, 0)，
+  // 前端这边也不能显示成负数（本地状态万一偏了，界面不该跟着错）
+  isLiked.value = !prevLiked
+  v.likes_count = Math.max(0, prevCount + (prevLiked ? -1 : 1))
+
+  // 写成箭头函数而不是 function 声明：函数声明会被提升，TS 在里面不放行
+  // `const v` 上面那次 null 收窄（"v 在函数声明里可能在别处被调用"），
+  // 于是报 'v' is possibly 'null'。箭头函数就地定义、收窄有效。
+  const rollback = () => {
+    isLiked.value = prevLiked
+    v.likes_count = prevCount
+  }
+
+  likeBusy.value = true
+  notice.value = ''
+  needLogin.value = false
+  try {
+    if (prevLiked) await unlikeVideo(v.id)
+    else await likeVideo(v.id)
+  } catch (e) {
+    rollback()
+    if (e instanceof ApiError && e.status === 401) {
+      // api/client.ts 的 handleResponse 对**任何** 401 都会 clearTokens。
+      // token 过期时点个赞会静默把人登出，不解释一句用户完全不知道为什么
+      notice.value = '登录状态已失效，请重新登录后再试。'
+      needLogin.value = true
+    } else if (e instanceof ApiError && e.status === 404) {
+      notice.value = '这个视频不存在或已被删除（可能刚被作者删掉）。'
+    } else {
+      notice.value = e instanceof Error ? e.message : '操作失败'
+    }
+    // 乐观更新真正难的地方不是"请求失败"，而是"失败时本地状态**本来就是错的**"：
+    // 比如同一个人在另一个标签页赞过了，我们这边还显示未赞 —— 这时仅回滚会把
+    // 错误状态继续留着。业务错误（500）说明服务器和我们对同一件事有不同看法，
+    // 所以再对一次账；网络类错误（status 0）服务器根本没表态，回滚就够了。
+    if (e instanceof ApiError && e.status >= 500) void resyncLike(v.id)
+  } finally {
+    likeBusy.value = false
+  }
+}
+
+/** 以后端为准，重新对齐 isLiked 和计数。只在乐观更新失败后调用 */
+async function resyncLike(id: number) {
+  try {
+    const [state, raw] = await Promise.all([fetchIsLiked(id), getDetail(id)])
+    if (video.value?.id !== id) return
+    isLiked.value = state.is_liked
+    // 计数以 getDetail 为准：like/unlike 的响应里只有一句 message，没有计数
+    video.value.likes_count = raw.likes_count
+  } catch {
+    /* 对账也失败就保持回滚后的值 —— 用户还能再点一次，不该弹第二个错误 */
+  }
 }
 
 /**
@@ -241,6 +362,7 @@ async function onDelete() {
 
   deleting.value = true
   notice.value = ''
+  needLogin.value = false
   try {
     await deleteVideo(v.id)
     // replace 而不是 push：push 会在历史里留下 /video/:id，按返回又落回刚删掉的那一页
@@ -251,16 +373,13 @@ async function onDelete() {
       // 不是本人 / token 过期时删除会 401，不解释一句的话，
       // 用户只会发现自己莫名其妙被登出了，完全不知道是刚才那一下删除导致的
       notice.value = '登录状态已失效，请重新登录后再试。'
+      needLogin.value = true
     } else {
       notice.value = e instanceof Error ? e.message : '删除失败'
     }
   } finally {
     deleting.value = false
   }
-}
-
-function noop() {
-  /* 评论接口还不存在 */
 }
 </script>
 
@@ -366,52 +485,15 @@ function noop() {
   overflow-wrap: anywhere;
 }
 
-.comments {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  padding: 18px;
-  border-radius: 18px;
-}
-.comments h2 {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin: 0;
-  font-size: 0.95rem;
-}
-.cinput {
-  width: 100%;
-  resize: vertical;
-  padding: 11px 13px;
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  background: var(--surface-2);
-  color: var(--ink-muted);
-  font-family: inherit;
-  font-size: 0.88rem;
-}
-.comments .btn {
-  align-self: flex-start;
-  min-height: 38px;
-  padding: 0 18px;
-  font-size: 0.88rem;
-}
+/* 评论区的样式全在 CommentSection.vue 里（scoped）。
+   这里原本有 .comments/.cinput/.soon/.note 四条规则，随"评论区占位"一起删了 ——
+   .soon（阶段角标）是这个文件里最后一处使用，它退休了；阶段7+ 再加
+   "未接入"角标时，那套样式应该在新的组件里重新写，而不是在这里留一份无人引用的 */
 
-/* 阶段角标：和操作栏、桌面频道条是同一套说法 */
-.soon {
-  padding: 1px 7px;
-  border-radius: 999px;
-  border: 1px solid var(--border);
-  background: var(--surface-2);
-  color: var(--ink-muted);
-  font-size: 0.68rem;
-  font-weight: 600;
-}
-
-.note {
-  margin: 0;
-  font-size: 0.78rem;
+.alert-link {
+  margin-left: 6px;
+  color: currentColor;
+  text-decoration: underline;
 }
 
 .side {

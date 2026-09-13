@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"myfeed/internal/social"
 	"myfeed/internal/video"
 
 	"gorm.io/gorm"
@@ -110,7 +111,60 @@ func (repo *FeedRepository) ListByTag(ctx context.Context, tagName string, limit
 	return videos, err
 }
 
-// ListByFollowing 关注流：子查询"我关注的人"→ 倒序翻页。
-// 阶段6回填（依赖 social 包，本阶段先不实现）：
-//   viewerAccountID > 0 时加 author_id IN (SELECT vlogger_id FROM socials WHERE follower_id = ?)
-//   匿名（0）时原项目退化为全局最新流
+// ListByFollowing 关注流：子查询"我关注的人" → 时间倒序翻页。
+//
+// 这是全项目**唯一一条跨模块的 SQL**，也是 feed 包第一次认识别人的表结构：
+//
+//	SELECT * FROM videos
+//	 WHERE author_id IN (SELECT vlogger_id FROM socials WHERE follower_id = ?)
+//	   AND create_time < ?
+//	 ORDER BY create_time DESC LIMIT ?
+//
+// 依赖方向 feed → social 发生在**模型层**（import social.Social 只为了拿到表名）。
+// 另一种做法是让 social repo 暴露 `FollowingIDs(ctx, followerID) ([]uint, error)`，
+// feed 拿到 ID 列表再拼 `IN ?` —— 那样 feed 就不用认识 socials 表了。两种写法
+// 各有一个真实的代价：
+//
+//	子查询下推（本实现）：一次往返；代价是 feed 依赖 social 的**表结构**
+//	先查 ID 再 IN：解耦；代价是两次往返 + 关注数很大时 IN 列表很长
+//
+// 原项目选了前者。注意"少一次往返"在这个查询里的分量：这是一条**翻页**查询，
+// 用户每次滚动都要打一次，往返次数直接乘在滑动的流畅度上。
+//
+// **viewerAccountID > 0 这个判断要盯死。** 它的两种走向差别极大：
+//
+//	> 0 → 加过滤，只看到关注的人的视频
+//	== 0 → **完全不过滤**，退化成"全站最新流"
+//
+// 也就是说：这个判断写反、或者让 0 流进来，匿名用户就会看到全站内容 ——
+// 而"全站最新流"恰好是 /feed/listLatest，看起来完全正常，不会报错。
+// 防御不在这一层（repo 老实描述 SQL 的行为），在 **handler**：
+// listByFollowing 挂强鉴权，且 GetAccountID 失败时**直接 401，绝不放行**。
+//
+// 顺带一个正确的边界情况：一个人谁也没关注时，子查询返回**空集**，
+// `IN (空集)` 匹配 0 行 → 空列表。这正是想要的（**不是**全站视频）。
+// 这个正确性不是我们争取来的，是 SQL 语义自带的 —— 所以"空关注列表"这条
+// 验收必测：它一旦坏了，坏法和"忘记加过滤"一模一样。
+func (repo *FeedRepository) ListByFollowing(ctx context.Context, limit int, viewerAccountID uint, latestBefore time.Time) ([]*video.Video, error) {
+	var videos []*video.Video
+	query := repo.db.WithContext(ctx).Model(&video.Video{}).
+		Order("create_time DESC") // 排序键，和 ListLatest 一致
+
+	if viewerAccountID > 0 {
+		// 子查询**下推给 MySQL**，不在 Go 里先查 ID 再拼 IN（理由见上）
+		followingSubQuery := repo.db.WithContext(ctx).
+			Model(&social.Social{}).
+			Select("vlogger_id").
+			Where("follower_id = ?", viewerAccountID)
+		query = query.Where("author_id IN (?)", followingSubQuery)
+	}
+
+	if !latestBefore.IsZero() {
+		query = query.Where("create_time < ?", latestBefore) // 镜像：同一键的"严格小于"
+	}
+
+	if err := query.Limit(limit).Find(&videos).Error; err != nil {
+		return nil, err
+	}
+	return videos, nil
+}

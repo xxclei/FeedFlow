@@ -13,12 +13,18 @@ import { filterPicked, titleFromFilename, type PickedFile, type Rejected } from 
 import { chunkCount, fingerprintFile, type FileFingerprint } from '../utils/hash'
 import { Semaphore } from '../utils/pool'
 import { isAbort, withRetry } from '../utils/retry'
+import { normalizeTagNames } from '../utils/tags'
 import { useAuthStore } from './auth'
 
 /** 文件级并行度。每个文件内部还有 3 条分片泳道，总在途由全局闸门压住 */
 const MAX_FILES_IN_FLIGHT = 2
 /** 全局分片闸门。浏览器同源连接上限 6，留 2 个给 JSON 请求，否则刷新/发布会被分片堵在后面 */
 const MAX_CHUNKS_IN_FLIGHT = 4
+
+/** description 列宽（varchar(255)，单位是**字符**不是字节）。见 effectiveDescription */
+const MAX_DESCRIPTION_RUNES = 255
+/** 批量面板最多几个标签。后端不限个数，这里封顶纯粹是防"粘进来一大段" */
+const MAX_BATCH_TAGS = 20
 
 export type ItemState =
   | 'queued' // 已入队，等调度
@@ -55,9 +61,29 @@ export interface QueueItem {
   claimed: boolean
 }
 
+/**
+ * 批量面板上的三个选项。
+ *
+ * ---------- 它们**都在发布的那一刻**才生效，不是入队时 ----------
+ *
+ * 老版本把 titlePrefix 拼进 item.title（入队时算一次），把 extraTags 塞进描述，
+ * 于是"先选文件、再改选项"只对**之后**选的文件生效 —— 用户改完前缀发现前面那些没变，
+ * 只能全删重选。这是同一个 bug 的两个实例，所以本轮三个选项统一改成
+ * **在 runItem 里现算**（见 effectiveTitle / effectiveDescription / effectiveTags）。
+ *
+ * ---------- extraTags（string）为什么变成 tags（string[]）----------
+ *
+ * 老的 extraTags 是一个裸输入框，它的内容会**整个**变成每条视频的描述，
+ * 后端再从描述里用正则抽 #xxx。于是"打 日常 vlog 不带 #"= 一个标签都没有，
+ * 而且不报错、不提示。现在标签有专门的 chip 编辑器（TagChipsInput），
+ * 传出去的是结构化数组，后端直接落 video_tags —— 不再经过"文本 → 正则 → 猜意图"。
+ */
 export interface BatchOptions {
   titlePrefix: string
-  extraTags: string
+  /** 统一描述（可选）。标签**不再**从这里走，见 tags */
+  description: string
+  /** 统一标签。发布时作为 tag_names 送出去，和描述里手写的 #xxx 取并集 */
+  tags: string[]
 }
 
 // File 和指纹不进响应式图：Vue 的 reactive 会深度遍历，500MB 的 File 没必要被代理，
@@ -76,7 +102,7 @@ export const useUploadQueueStore = defineStore('uploadQueue', () => {
 
   const items = ref<QueueItem[]>([])
   const rejected = ref<Rejected[]>([])
-  const options = ref<BatchOptions>({ titlePrefix: '', extraTags: '' })
+  const options = ref<BatchOptions>({ titlePrefix: '', description: '', tags: [] })
   const paused = ref(false)
   const started = ref(false)
   const fatalError = ref('')
@@ -153,7 +179,9 @@ export const useUploadQueueStore = defineStore('uploadQueue', () => {
         filename: p.file.name,
         relPath: p.relPath,
         size: p.file.size,
-        title: applyPrefix(titleFromFilename(p.file.name)),
+        // **基础标题**：只从文件名推，不含前缀。前缀在发布时现拼（见 effectiveTitle）——
+        // 存进来的标题带上前缀的话，"改前缀"就只能对后来者生效了
+        title: titleFromFilename(p.file.name),
         state: 'queued',
         phaseLabel: '等待中',
         bytesDone: 0,
@@ -184,14 +212,57 @@ export const useUploadQueueStore = defineStore('uploadQueue', () => {
     if (started.value && created.length) void hashPass().then(wake)
   }
 
-  function applyPrefix(title: string): string {
+  // ---------- 三个"发布时才现算"的派生值 ----------
+  //
+  // 放在这里而不是入队时算进 item 里，是为了让"改选项"对**已经入队的文件**也生效。
+  // 它们都是普通函数而不是 computed：调用点在 runItem 里（非响应式上下文），
+  // 而模板里调用时每次渲染都会重新求值 —— 两边都成立。
+
+  /** 最终标题 = 前缀 + 基础标题 */
+  function effectiveTitle(it: QueueItem): string {
     const p = options.value.titlePrefix.trim()
-    return p ? `${p}${title}` : title
+    return p ? `${p}${it.title}` : it.title
   }
 
-  /** 统一标签走描述：后端从 title/description 里抽 #xxx，这样批量加 #vlog 不用逐个改标题 */
-  function descriptionFor(): string {
-    return options.value.extraTags.trim()
+  /** 最终标签。走 normalizeTagNames，和后端 normalizeTagNames 同一套规则 */
+  function effectiveTags(_it: QueueItem): string[] {
+    // _it 参数当前用不上（标签是整批统一的），但保留它让三个 effective* 签名一致 ——
+    // 将来"每个文件单独调标签"时只改实现，不用改所有调用点
+    return normalizeTagNames(options.value.tags).slice(0, MAX_BATCH_TAGS)
+  }
+
+  /**
+   * 最终描述 = 统一描述 + 标签（渲染成 `#a #b`）。
+   *
+   * ---------- 为什么标签要**同时**写进描述文本 ----------
+   *
+   * 两件事都指向同一个结论：
+   *
+   *  1. **词法搜索只覆盖 title + description**（FULLTEXT 索引 ft_videos_title_desc 就建在
+   *     这两列上），video_tags 不参与词法检索。标签不落到文本里的话，批量投稿的视频
+   *     按标签搜不到 —— 而单独投稿的（TagInput 把 #标签 写进描述）能搜到。
+   *     同一个功能两种行为，用户没法理解。
+   *  2. 卡片上的标签 chip 是从 title/description 里正则解析出来的
+   *     （后端响应目前不返回 tags），不写进文本就**不显示**。
+   *
+   * 所以这是一处刻意的冗余：**结构化标签（tag_names）是权威来源，描述里的文本是投影**。
+   * 等 /feed 响应带上 tags、FULLTEXT 也覆盖 video_tags 之后，这一行就可以删掉。
+   *
+   * 长度按 rune 截到 255（description 是 varchar(255)，MySQL 的 N 是**字符数**）：
+   * 超了会撞 1406 → 被兜成 500，而用户只会看到"发布失败"，看不出是描述太长。
+   * 老版本的 extraTags 是原样发出去的，一直有这个隐患。
+   */
+  function effectiveDescription(it: QueueItem): string {
+    const parts: string[] = []
+    const desc = options.value.description.trim()
+    if (desc) parts.push(desc)
+    const tags = effectiveTags(it)
+    if (tags.length) parts.push(tags.map((t) => `#${t}`).join(' '))
+    const text = parts.join(' ')
+    const runes = Array.from(text)
+    return runes.length > MAX_DESCRIPTION_RUNES
+      ? runes.slice(0, MAX_DESCRIPTION_RUNES).join('')
+      : text
   }
 
   // ---------- 阶段一：逐个算指纹（算完一个就能开传） ----------
@@ -497,11 +568,14 @@ export const useUploadQueueStore = defineStore('uploadQueue', () => {
       })
 
       it.phaseLabel = '发布…'
+      // 三个字段都是**此刻**现算的（不是入队时算好存进 item 的）——
+      // 所以用户在上传途中改前缀/描述/标签，连正在传的这个都会用上新的
       const video = await withRetry(
         () =>
           publish({
-            title: it.title,
-            description: descriptionFor(),
+            title: effectiveTitle(it),
+            description: effectiveDescription(it),
+            tag_names: effectiveTags(it),
             play_url: playUrl,
             cover_url: cover.cover_url,
           }),
@@ -559,7 +633,8 @@ export const useUploadQueueStore = defineStore('uploadQueue', () => {
       // publish 要求 cover_url 非空，抽帧却会因为文件损坏/编码不支持而失败。
       // 本地画一张占位图兜底：零网络、不可能失败，整批不会卡在最后一步。
       it.phaseLabel = '视频无法截帧，使用占位封面'
-      const blob = await renderFallbackCover(it.title)
+      // 用**最终标题**画在封面上：占位图里写着标题，用户看到的就是发出去的那条
+      const blob = await renderFallbackCover(effectiveTitle(it))
       it.coverSource = 'fallback'
       it.coverPreview = URL.createObjectURL(blob)
       return blob
@@ -687,6 +762,11 @@ export const useUploadQueueStore = defineStore('uploadQueue', () => {
     finished,
     addPicked,
     reset,
+    // 三个派生值要暴露给模板：列表里显示"这个文件最终会带上什么"，
+    // 以及让"改选项立即对所有已入队文件生效"这件事在界面上看得见
+    effectiveTitle,
+    effectiveDescription,
+    effectiveTags,
     start,
     pause,
     resume,

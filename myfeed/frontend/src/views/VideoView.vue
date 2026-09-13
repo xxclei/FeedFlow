@@ -68,12 +68,22 @@
             <input v-model="q.options.titlePrefix" placeholder="例如：2026 合辑 · " />
           </div>
           <div class="field">
-            <label>统一标签（写进描述，后端会抽成标签）</label>
-            <input v-model="q.options.extraTags" placeholder="#vlog #日常" />
+            <label>统一描述（可留空）</label>
+            <input v-model="q.options.description" placeholder="例如：周末随手拍" />
           </div>
         </div>
+        <div class="field">
+          <label>统一标签（回车成标签，不用打 <code>#</code>）</label>
+          <TagChipsInput v-model="q.options.tags" placeholder="例如：日常 vlog（空格或回车分隔）" />
+        </div>
         <p class="text-muted note">
-          标题从文件名推：去扩展名、去掉开头的 <code>01 - </code> 这类序号。改完前缀后，之后再选的文件才会用上它。
+          标题从文件名推：去扩展名、去掉开头的 <code>01 - </code> 这类序号。
+          <strong>三个选项都是发布那一刻才生效的，改完立刻对已经入队的文件也生效</strong>
+          （老版本只对之后新选的文件生效，改完前缀得全删重选）。
+        </p>
+        <p v-if="q.options.tags.length" class="text-muted note">
+          标签会同时写进描述文本 —— 词法搜索只覆盖 title/description（FULLTEXT 索引建在这两列上），
+          不写进去的话按标签搜不到这些视频，而单独投稿的能搜到。
         </p>
       </div>
 
@@ -127,6 +137,8 @@
             v-for="it in q.items"
             :key="it.id"
             :item="it"
+            :title="q.effectiveTitle(it)"
+            :tags="q.effectiveTags(it)"
             @cancel="q.cancelItem"
             @retry="q.retryItem"
             @remove="q.removeItem"
@@ -162,11 +174,41 @@
     <div class="card">
       <h2>我的作品</h2>
       <p v-if="videos.length === 0" class="text-muted">还没有作品，发一个？</p>
+
+      <!-- 批量操作条。只勾了就出现 —— 空选时挂一条"已选 0 条"的禁用条是纯噪音 -->
+      <div v-if="videos.length" class="bulk">
+        <label class="pick">
+          <input type="checkbox" :checked="allSelected" :indeterminate.prop="someSelected" @change="toggleAll" />
+          <span class="text-muted">
+            全选（{{ videos.length }} 条）<template v-if="selected.size"> · 已选 {{ selected.size }} 条</template>
+          </span>
+        </label>
+        <button
+          v-if="selected.size"
+          class="btn btn-ghost del"
+          type="button"
+          :disabled="batchBusy"
+          @click="onDeleteSelected"
+        >
+          {{ batchBusy ? '删除中…' : `删除选中（${selected.size}）` }}
+        </button>
+      </div>
+
+      <p v-if="batchMsg" class="text-ok note">{{ batchMsg }}</p>
+      <p v-if="listError" class="text-error note">{{ listError }}</p>
+
       <!-- 列表里**不再内嵌 <video>**，改成缩略图 + 跳播放页。
            以前每个作品都挂一个真 <video> 元素：作品一多就是几十个解码器常驻，
            而 Chrome 对同时活跃的 video 元素有硬上限（约 75 个，见 utils/cover.ts 的注释），
            超了直接 onerror。要播就进 /video/:id，那里只允许有一个播放器存在。 -->
-      <div v-for="v in videos" :key="v.id" class="video-item">
+      <div v-for="v in videos" :key="v.id" class="video-item" :class="{ picked: selected.has(v.id) }">
+        <input
+          class="box"
+          type="checkbox"
+          :checked="selected.has(v.id)"
+          :aria-label="`选择 ${v.title}`"
+          @change="toggleOne(v.id)"
+        />
         <RouterLink class="thumb" :to="`/video/${v.id}`" :aria-label="`打开 ${v.title}`">
           <img :src="staticURL(v.cover_url)" :alt="v.title" loading="lazy" />
           <span class="glyph" aria-hidden="true">
@@ -180,7 +222,7 @@
             <RouterLink :to="`/video/${v.id}`">#{{ v.id }} {{ v.title }}</RouterLink>
           </strong>
           <span class="text-muted mono">{{ v.create_time?.slice(0, 19) }}</span>
-          <button class="btn btn-ghost del" @click="onDelete(v)">删除</button>
+          <button class="btn btn-ghost del" :disabled="batchBusy" @click="onDelete(v)">删除</button>
         </div>
       </div>
     </div>
@@ -192,10 +234,12 @@ import { computed, onMounted, ref, watch } from 'vue'
 import { RouterLink, useRoute, useRouter } from 'vue-router'
 
 import TagInput from '../components/TagInput.vue'
+import TagChipsInput from '../components/TagChipsInput.vue'
 import UploadDropZone from '../components/upload/UploadDropZone.vue'
 import UploadItemRow from '../components/upload/UploadItemRow.vue'
 import {
   deleteVideo,
+  deleteVideoBatch,
   listByAuthorID,
   publish,
   staticURL,
@@ -225,10 +269,44 @@ function go(m: 'single' | 'batch') {
 
 const videos = ref<VideoItem[]>([])
 
+/** 勾选状态。用 Set 而不是数组：判断"这一条勾了没有"在每个 checkbox 的渲染里都要做，
+ *  数组的 includes 是 O(n)，一页 200 条就是每次渲染 200×200 次比较 */
+const selected = ref(new Set<number>())
+const allSelected = computed(() => videos.value.length > 0 && selected.value.size === videos.value.length)
+const someSelected = computed(() => selected.value.size > 0 && !allSelected.value)
+
+/** 每批最多删多少。**和后端 maxBatchDeleteIDs 一致** —— 后端超了回 400 */
+const MAX_BATCH_DELETE = 100
+
+const batchBusy = ref(false)
+const batchMsg = ref('')
+/** 「我的作品」自己的错误位。**刻意不复用下面那个 error** ——
+ *  那个属于单个投稿卡片，共用的话一条删除失败会在两个卡片里各显示一次 */
+const listError = ref('')
+
+function toggleOne(id: number) {
+  // 必须换一个新的 Set：ref(new Set()) 里改元素**不会触发**响应式更新
+  // （Vue 的 reactive 不认识 Set 的原地修改），而只改 Set 再赋值自己也不行 ——
+  // 引用没变，Vue 认为没变化。这里每次都造新对象
+  const next = new Set(selected.value)
+  if (next.has(id)) next.delete(id)
+  else next.add(id)
+  selected.value = next
+}
+
+function toggleAll() {
+  selected.value = allSelected.value ? new Set() : new Set(videos.value.map((v) => v.id))
+}
+
 async function loadMyVideos() {
   const accountID = auth.claims?.account_id
   if (!accountID) return
   videos.value = await listByAuthorID(accountID)
+  // 列表换了，勾选里可能有已经不存在的 id（另一个标签页删过了）。
+  // 留着它会让"已选 3 条"里的 1 条永远删不掉、skipped_ids 里反复出现它 ——
+  // 那种"每次都少一条"的现象比直接清空勾选更难理解
+  const alive = new Set(videos.value.map((v) => v.id))
+  selected.value = new Set([...selected.value].filter((id) => alive.has(id)))
 }
 onMounted(loadMyVideos)
 
@@ -249,7 +327,58 @@ async function onDelete(v: VideoItem) {
     await deleteVideo(v.id)
     await loadMyVideos()
   } catch (e) {
-    error.value = e instanceof Error ? e.message : '删除失败'
+    listError.value = e instanceof Error ? e.message : '删除失败'
+  }
+}
+
+/**
+ * 批量删除。
+ *
+ * ---------- 三种结果要分开说，不能笼统报"删除成功" ----------
+ *
+ * 后端刻意回 deleted_ids / skipped_ids 而不是一个计数，就是为了让这里能如实转达。
+ * 勾选列表可能是旧的（另一个标签页先删过了，或者勾的时候还在、提交时已经没了），
+ * 所以"3 条里删掉 2 条"是**正常结果**，不是错误。
+ *
+ *   · 全删掉   → "已删除 3 条"
+ *   · 部分成功 → "3 条删掉 2 条，1 条没删掉（不是你的，或已经删过了）"，
+ *                并把没删掉的那条**留在勾选态里**让用户能重试
+ *   · 全失败   → 走 catch（比如 403/网络断了），那是真错误
+ *
+ * 如果这里只报"删除成功"，用户回头刷一下发现还有一条在，只会认为删除功能是坏的。
+ */
+async function onDeleteSelected() {
+  const ids = [...selected.value]
+  if (ids.length === 0) return
+
+  // 超限时**拒绝**而不是悄悄截断前 100 条：截断的话用户以为都删了，
+  // 而实际上后面的还在（而且他还得重新勾一遍）
+  if (ids.length > MAX_BATCH_DELETE) {
+    listError.value = `一次最多删 ${MAX_BATCH_DELETE} 条，当前勾了 ${ids.length} 条，请分批删`
+    return
+  }
+  if (!window.confirm(`确认删除选中的 ${ids.length} 条作品？（数据库记录删除，磁盘文件保留）`)) return
+
+  listError.value = ''
+  batchMsg.value = ''
+  batchBusy.value = true
+  try {
+    const res = await deleteVideoBatch(ids)
+    if (res.skipped_ids?.length) {
+      batchMsg.value =
+        `已删除 ${res.deleted} 条，${res.skipped_ids.length} 条没删掉` +
+        `（#${res.skipped_ids.join(' #')} —— 不是你的，或已经删过了）。它们仍留在勾选里，可以重试。`
+      // 没删掉的留在勾选态：用户想重试就不用重新找一遍
+      selected.value = new Set(res.skipped_ids)
+    } else {
+      batchMsg.value = `已删除 ${res.deleted} 条`
+      selected.value = new Set()
+    }
+    await loadMyVideos()
+  } catch (e) {
+    listError.value = e instanceof Error ? e.message : '批量删除失败'
+  } finally {
+    batchBusy.value = false
   }
 }
 
@@ -591,12 +720,46 @@ h3 {
   line-height: 1.7;
 }
 
+.bulk {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
+  padding: 4px 0 12px;
+}
+.pick {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.84rem;
+  cursor: pointer;
+}
+.pick input,
+.box {
+  width: 16px;
+  height: 16px;
+  flex: 0 0 auto;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+.bulk .btn {
+  min-height: 34px;
+  padding: 0 14px;
+  font-size: 0.84rem;
+}
+
 .video-item {
   display: flex;
   gap: 16px;
   align-items: center;
   padding: 12px 0;
   border-top: 1px solid var(--border);
+}
+/* 勾中的行给一点底色，否则在多选一排里看不出自己勾了哪几条 */
+.video-item.picked {
+  background: rgba(232, 103, 74, 0.05);
+  border-radius: 10px;
 }
 .thumb {
   position: relative;

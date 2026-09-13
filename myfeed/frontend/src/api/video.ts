@@ -48,6 +48,15 @@ export function publish(payload: {
   description: string
   play_url: string
   cover_url: string
+  /**
+   * 结构化标签（批量投稿的 chip 编辑器产出）。**和描述里手写的 #xxx 取并集**，
+   * 不是二选一 —— 所以老路径不传它时行为一个字不变。
+   *
+   * 它比"往描述里写 #标签"可靠的地方：不带 # 也能成标签（不用记语法）、
+   * 按 rune 截到 100（不会撑爆 varchar(100) 变成 500）、按小写去重
+   * （tags.name 是 _ci 排序规则，"Go" 和 "go" 是同一个标签）。
+   */
+  tag_names?: string[]
 }) {
   return postJson<VideoItem>('/video/publish', payload, { authRequired: true })
 }
@@ -58,6 +67,36 @@ export function listByAuthorID(authorID: number) {
 
 export function deleteVideo(id: number) {
   return postJson<{ message: string }>('/video/delete', { id }, { authRequired: true })
+}
+
+/** 批量删除的响应：**删除成功和部分成功要分开报**（见下面 deleteVideoBatch） */
+export interface DeleteBatchResult {
+  deleted: number
+  deleted_ids: number[]
+  /** 没能删掉的 id：不是你的，或者已经不存在了。后端无法区分这两者，也不该区分 */
+  skipped_ids: number[]
+}
+
+/**
+ * 批量删除。
+ *
+ * ---------- 为什么响应里要有 skipped_ids ----------
+ *
+ * "3 条里删掉 2 条"是**正常结果**，不是错误：勾选列表可能是旧的（另一个标签页
+ * 先删过了，或者勾的时候还在、提交时已经没了）。所以这个接口不会因为"有一条删不掉"
+ * 而整体失败 —— 那种语义更难用：一次手滑多勾一条就整批白删。
+ *
+ * 代价是**前端必须如实转达**：skipped_ids 非空时不能笼统报"删除成功"，
+ * 否则用户以为 3 条都没了，回头看见一条还在会觉得见了鬼。
+ *
+ * 上限 100 条（后端定的，管的是请求体大小和事务持有时间，不是业务规则）。
+ */
+export function deleteVideoBatch(ids: number[]) {
+  return postJson<DeleteBatchResult>(
+    '/video/deleteBatch',
+    { ids },
+    { authRequired: true },
+  )
 }
 
 /**
@@ -89,7 +128,10 @@ export function getDetail(id: number) {
  *   1. `username` 是 videos 表里的**快照**（发视频时抄下来的），改名后不会更新。
  *      所以展示作者名要以 /account/findByID 的实时结果为准，别用这个字段 ——
  *      否则同一个页面上"标题旁的作者"和"作者卡里的作者"会是两个名字。
- *   2. `is_liked: false` 不算撒谎：`/feed/*` 今天也是硬编码 false（阶段4 回填）。
+ *   2. 这里填 `is_liked: false` **不是**默认值偷懒：videos 表里根本没有"我赞过没有"
+ *      这个信息（它是 likes 表和"我"的交叉，不属于视频），`/video/*` 也就返回不了。
+ *      要真实状态只能另外调 `/like/isLiked` —— 详情页正是这么做的。
+ *      注意这已经和 `/feed/*` 不同了：那边阶段4 起返回的是真值。
  */
 export function normalizeVideo(v: VideoItem): FeedVideoItem {
   return {

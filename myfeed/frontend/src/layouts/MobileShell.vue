@@ -34,7 +34,7 @@
           ref="searchInput"
           v-model="q"
           type="search"
-          placeholder="搜标签，输入 日常 或 #日常"
+          placeholder="搜视频；带 # 则进标签流"
           @keydown.esc="searchOpen = false"
         />
         <button class="go" type="submit">搜索</button>
@@ -71,12 +71,22 @@ async function toggleSearch() {
   }
 }
 
+/**
+ * 搜索框的分流：`#` 开头走标签流（指名一个标签），其余走全文检索。
+ * 理由和桌面端 DeskopShell 里那段一模一样 —— 一个框认两种意图。
+ */
 function onSearch() {
-  const name = q.value.trim().replace(/^#+/, '')
-  if (!name) return
+  const raw = q.value.trim()
+  if (!raw) return
   searchOpen.value = false
   q.value = ''
-  router.push(`/tag/${encodeURIComponent(name)}`)
+  if (raw.startsWith('#')) {
+    const name = raw.replace(/^#+/, '').trim()
+    if (!name) return
+    router.push(`/tag/${encodeURIComponent(name)}`)
+    return
+  }
+  router.push({ path: '/search', query: { q: raw } })
 }
 </script>
 

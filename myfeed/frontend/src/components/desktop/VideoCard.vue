@@ -11,6 +11,21 @@
       </span>
       <!-- 角标位：B 站放时长，我们还没有 duration 字段，放点赞数 -->
       <span class="badge mono">{{ item.likes_count }}</span>
+
+      <!-- 「已赞」标记：is_liked 从阶段4 起是真值了（游客恒 false，所以不会误标）。
+           放在左上角，和右下角的计数角标分开，避免两个数字/标签挤在一起 -->
+      <span v-if="item.is_liked" class="liked" aria-label="你赞过这个视频">
+        <svg viewBox="0 0 24 24" width="11" height="11" aria-hidden="true">
+          <path
+            d="M7 10.5v9H4.6a1 1 0 0 1-1-1v-7a1 1 0 0 1 1-1zm0 0 4.3-7a1.6 1.6 0 0 1 2.9 1.3l-.9 3.7h5.2a1.7 1.7 0 0 1 1.7 2.1l-1.5 7a1.7 1.7 0 0 1-1.7 1.4H7"
+            fill="currentColor"
+            stroke="currentColor"
+            stroke-width="1.7"
+            stroke-linejoin="round"
+          />
+        </svg>
+        已赞
+      </span>
     </RouterLink>
 
     <div class="meta">
@@ -115,6 +130,21 @@ const tags = computed(() => extractTags(props.item.title, props.item.description
   background: rgba(15, 15, 18, 0.78);
   color: var(--ink);
   font-size: 0.7rem;
+}
+
+.liked {
+  position: absolute;
+  left: 6px;
+  top: 6px;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 1px 6px;
+  border-radius: 5px;
+  background: rgba(15, 15, 18, 0.78);
+  color: var(--accent);
+  font-size: 0.68rem;
+  font-weight: 600;
 }
 
 /* ---------- 文字 ---------- */

@@ -13,7 +13,7 @@
             <circle cx="11" cy="11" r="6.5" fill="none" stroke="currentColor" stroke-width="2" />
             <path d="m16 16 4.5 4.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
           </svg>
-          <input v-model="q" type="search" placeholder="搜标签，输入 日常 或 #日常 回车" />
+          <input v-model="q" type="search" placeholder="搜视频；带 # 则进标签流（如 #日常）" />
         </form>
 
         <div class="top-actions">
@@ -37,7 +37,13 @@
     <nav class="channels">
       <div class="channels-inner">
         <template v-for="c in channels" :key="c.label">
-          <span v-if="c.soon" class="channel off" :title="c.soon">{{ c.label }}</span>
+          <!-- auth 频道对游客显示成灰的（不可点）：/feed/listByFollowing 挂的是
+               JWTAuth，游客点进去必然 401 —— 而 handleResponse 对任何 401 都会
+               clearTokens。灰掉比"点了被登出"体面，也比隐藏强：至少告诉他
+               有这么个东西，登录了才有 -->
+          <span v-if="c.auth && !auth.isLoggedIn" class="channel off" :title="c.title">
+            {{ c.label }}
+          </span>
           <RouterLink v-else class="channel" :class="{ on: isActive(c) }" :to="c.to">
             {{ c.label }}
           </RouterLink>
@@ -70,14 +76,32 @@ interface Channel {
   label: string
   to: string
   tab?: string
-  soon?: string
+  /** 必须登录才可点。游客看到的是灰态 */
+  auth?: boolean
+  title?: string
 }
 
+// 四个频道 = 四个流，全部落在同一个 /feed 页上，只换 query。
+//
+// **刻意没有单独的 /following 路由**：关注流和最新流是同一个页面、同一套网格、
+// 同一个 useFeedStream 单例，只是数据源不同。为它开一条路由等于把 FeedView
+// 复制一份，或者让那个单例被两个页面共享 —— 前者会分叉，后者会把状态搞乱。
+// query 参数本来就是"同一个页面的不同视图"最合适的表达。
+//
+// （这一条替换掉了原来的 `{ label: '关注', to: '/following', soon: '阶段6接入' }`。
+//   .off 的灰态样式留着 —— 上面那个 auth 分支还在用，而且它表达的正是
+//   原来 soon 想表达的东西：一个现在点不了、但确实存在的入口。）
 const channels: Channel[] = [
   { label: '最新', to: '/feed', tab: 'latest' },
   { label: '点赞榜', to: '/feed?tab=likes', tab: 'likes' },
   { label: '热门榜', to: '/feed?tab=popularity', tab: 'popularity' },
-  { label: '关注', to: '/following', soon: '阶段6接入（依赖 social 模块）' },
+  {
+    label: '关注',
+    to: '/feed?tab=following',
+    tab: 'following',
+    auth: true,
+    title: '登录后可用 —— 关注流（/feed/listByFollowing 挂的是 JWTAuth）',
+  },
 ]
 
 // 频道高亮：既要在 /feed 上，tab 也要对得上，否则「最新」会在所有 tab 下都亮
@@ -86,11 +110,28 @@ function isActive(c: Channel): boolean {
   return route.path === '/feed' && c.tab === activeTab.value
 }
 
-// 没有搜索接口，搜索直接落到标签流（#标签 就是我们的检索维度）
+/**
+ * 搜索框的分流。
+ *
+ * ---------- 一个输入框，两种意图 ----------
+ *
+ * 打 `#日常` 的人是在**指名一个标签**，不是想搜"日常"这个词 ——
+ * 标签流（/tag/:name）是精确的、有明确边界的，比全文检索更符合他的意图。
+ * 其余情况走全文检索（/search?q=），那里是模糊匹配、按相关度排序。
+ *
+ * 这就是"搜索引擎"该有的样子：同样一个框，认得出用户要的是哪一种。
+ * 老版本的注释写着"没有搜索接口，搜索直接落到标签流"—— 本轮后半句改了。
+ */
 function onSearch() {
-  const name = q.value.trim().replace(/^#+/, '')
-  if (!name) return
-  router.push(`/tag/${encodeURIComponent(name)}`)
+  const raw = q.value.trim()
+  if (!raw) return
+  if (raw.startsWith('#')) {
+    const name = raw.replace(/^#+/, '').trim()
+    if (!name) return
+    router.push(`/tag/${encodeURIComponent(name)}`)
+    return
+  }
+  router.push({ path: '/search', query: { q: raw } })
 }
 
 async function onLogout() {

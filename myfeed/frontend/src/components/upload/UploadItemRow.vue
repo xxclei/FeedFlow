@@ -9,10 +9,18 @@
     </div>
 
     <div class="body">
-      <p class="name" :title="item.relPath">{{ item.title }}</p>
+      <!-- 显示的是**最终标题**（前缀 + 基础标题），不是 item.title。
+           前缀改成"发布时才拼"之后，item.title 只剩从文件名推出来的那半截，
+           直接显示它会让"我明明设了前缀"看起来像没生效 -->
+      <p class="name" :title="item.relPath">{{ displayTitle }}</p>
       <p class="sub mono text-muted">
         {{ humanSize(item.size) }}
         <template v-if="item.videoId"> · #{{ item.videoId }}</template>
+      </p>
+      <!-- 这一行是本轮的可见性来源：**这一批文件最终会带上哪些标签**。
+           没有它，用户只能靠"发完去库里查"才能确认标签生效了 -->
+      <p v-if="tags.length" class="tags">
+        <span v-for="t in tags" :key="t" class="tag">#{{ t }}</span>
       </p>
       <p class="phase" :class="{ err: item.state === 'failed' }">
         {{ item.error || item.phaseLabel }}
@@ -59,7 +67,16 @@ import { computed } from 'vue'
 
 import type { QueueItem } from '../../stores/uploadQueue'
 
-const props = defineProps<{ item: QueueItem }>()
+const props = withDefaults(
+  defineProps<{
+    item: QueueItem
+    /** 最终标题（前缀 + 基础标题）。不传就退回 item.title */
+    title?: string
+    /** 最终会带上的标签。由调用方从 store 的 effectiveTags 取 —— 本组件不去认识 store */
+    tags?: string[]
+  }>(),
+  { title: '', tags: () => [] },
+)
 const emit = defineEmits<{
   (e: 'cancel', id: string): void
   (e: 'retry', id: string): void
@@ -74,6 +91,7 @@ const canCancel = computed(
   () => !['done', 'failed', 'canceled'].includes(props.item.state),
 )
 const canRetry = computed(() => props.item.state === 'failed' || props.item.state === 'canceled')
+const displayTitle = computed(() => props.title || props.item.title)
 
 function humanSize(n: number): string {
   if (n >= 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`
@@ -163,6 +181,21 @@ function sourceLabel(s: string): string {
 .sub {
   margin: 0;
   font-size: 0.74rem;
+}
+.tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin: 2px 0 0;
+}
+.tag {
+  padding: 0 7px;
+  border: 1px solid rgba(232, 103, 74, 0.45);
+  border-radius: 999px;
+  background: rgba(232, 103, 74, 0.08);
+  color: var(--accent);
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
 }
 .phase {
   margin: 0;

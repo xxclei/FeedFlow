@@ -16,3 +16,12 @@ rabbitmq:
   port: 5672
   username: admin
   password: password123
+
+# 检索参数。整段不写也能跑（search/entity.go 的 withDefaults 兜底）。
+#
+# 向量那一路（Ollama + Redis Stack + 回填命令）本轮先跳过，
+# 所以这里**没有** ollama 段、也没有 dim / max_distance —— 那两个参数
+# 目前没有任何读者，写在配置里就是假旋钮（改了没反应，比缺参数更费时间）。
+search:
+  depth: 50              # 召回条数（融合前的候选池，和每页 limit 是两件事）
+  rrf_k: 60              # RRF 的 k（Cormack 2009 的经验值）；单路时不影响排序

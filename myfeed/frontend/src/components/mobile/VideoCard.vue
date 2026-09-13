@@ -3,6 +3,8 @@
     <RouterLink class="cover" :to="`/video/${item.id}`" :aria-label="`打开 ${item.title}`">
       <img :src="staticURL(item.cover_url)" :alt="item.title" loading="lazy" />
       <span class="badge mono">{{ item.likes_count }}</span>
+      <!-- 已赞标记：is_liked 从阶段4 起是真值（游客恒 false，不会误标） -->
+      <span v-if="item.is_liked" class="liked">已赞</span>
     </RouterLink>
 
     <h3 :title="item.title">
@@ -62,6 +64,18 @@ defineProps<{ item: FeedVideoItem }>()
   background: rgba(15, 15, 18, 0.78);
   color: var(--ink);
   font-size: 0.63rem;
+}
+
+.liked {
+  position: absolute;
+  left: 4px;
+  top: 4px;
+  padding: 0 5px;
+  border-radius: 4px;
+  background: rgba(15, 15, 18, 0.78);
+  color: var(--accent);
+  font-size: 0.62rem;
+  font-weight: 600;
 }
 
 h3 {

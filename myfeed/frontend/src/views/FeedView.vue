@@ -17,10 +17,13 @@
       </button>
     </div>
 
-    <!-- 移动端的壳里没有频道条，所以在这里补一个分段控件 -->
+    <!-- 移动端的壳里没有频道条，所以在这里补一个分段控件。
+         tabs 是**算出来的**不是常量：游客看不到「关注」——
+         /feed/listByFollowing 挂的是 JWTAuth，游客问了必然 401，
+         而 client.ts 对任何 401 都会 clearTokens。藏起来比"点了报错"体面 -->
     <nav v-if="!isDesktop" class="seg" aria-label="时间线">
       <button
-        v-for="t in FEED_TABS"
+        v-for="t in tabs"
         :key="t.key"
         type="button"
         :class="{ on: active === t.key }"
@@ -32,7 +35,15 @@
 
     <p v-if="!auth.isLoggedIn" class="guest">
       游客模式 —— 这四个接口挂的是 <code>SoftJWTAuth</code>，没登录也能刷，只是
-      <code>is_liked</code> 恒为 false。
+      <code>is_liked</code> 一律为 false：后端拿不到"我"是谁，回答不了"我赞过没有"。
+      登录后卡片上会出现「已赞」标记，点赞本身也要登录（<code>/like/*</code> 挂的是
+      强鉴权的 <code>JWTAuth</code>）。
+    </p>
+    <p v-else-if="active === 'following'" class="guest">
+      「关注」是 <code>/feed</code> 下唯一一条<strong>要登录</strong>的接口：
+      <code>/feed/listByFollowing</code> 上叠了一层额外的 <code>JWTAuth</code>，
+      因为它问的是"<strong>我</strong>关注的人"。谁也没关注时它是空的 —— 那是正确结果，
+      不是出错。
     </p>
 
     <component
@@ -50,9 +61,22 @@
           <path d="M26 27.5v11l10-5.5z" fill="currentColor" />
           <path d="M20 10h24" stroke="currentColor" stroke-width="2" stroke-linecap="round" opacity="0.45" />
         </svg>
-        <p class="empty-title">这条时间线还是空的</p>
-        <p class="text-muted">去「投稿」发一条，它会立刻出现在这里。</p>
-        <RouterLink class="btn" to="/video">去投稿</RouterLink>
+        <!-- 空态文案跟着流变。关注流空的原因和别的流完全不是一回事：
+             最新流空 = 全站没视频（去投稿）；关注流空 = 你没关注谁（去关注）。
+             写同一句话会直接误导人 —— 自己发的视频**不会**出现在关注流里 -->
+        <template v-if="active === 'following'">
+          <p class="empty-title">你还没有关注任何人</p>
+          <p class="text-muted">
+            关注流只显示你关注的人发的视频，所以它是空的 —— 这是正确结果，不是出错。
+            去发现页点开一条视频，作者卡上有关注按钮；点一下，TA 的新视频就会出现在这里。
+          </p>
+          <RouterLink class="btn" to="/feed">去发现页找人</RouterLink>
+        </template>
+        <template v-else>
+          <p class="empty-title">这条时间线还是空的</p>
+          <p class="text-muted">去「投稿」发一条，它会立刻出现在这里。</p>
+          <RouterLink class="btn" to="/video">去投稿</RouterLink>
+        </template>
       </template>
     </component>
 
@@ -72,7 +96,14 @@ import { RouterLink, useRoute, useRouter } from 'vue-router'
 import DebugPanel from '../components/DebugPanel.vue'
 import DesktopVideoGrid from '../components/desktop/VideoGrid.vue'
 import MobileVideoGrid from '../components/mobile/VideoGrid.vue'
-import { FEED_TABS, isTabKey, useFeedStream, type TabKey } from '../composables/useFeedStream'
+import {
+  FEED_TABS,
+  isTabKey,
+  requiresAuth,
+  useFeedStream,
+  visibleTabs,
+  type TabKey,
+} from '../composables/useFeedStream'
 import { useDevice } from '../composables/useDevice'
 import { useAuthStore } from '../stores/auth'
 
@@ -86,6 +117,8 @@ const { active, cur, load, setTab } = useFeedStream(12)
 // 端不同 → 网格组件不同，其余全一样
 const Grid = computed(() => (isDesktop.value ? DesktopVideoGrid : MobileVideoGrid))
 const curTab = computed(() => FEED_TABS.find((t) => t.key === active.value)!)
+// 登录状态变了（登入/登出）分段控件要跟着增删一个 tab，所以是 computed 不是常量
+const tabs = computed(() => visibleTabs(auth.isLoggedIn))
 
 // ---------- 路由 ↔ 当前流 双向同步 ----------
 // 用 query 而不是组件内状态：桌面频道条在壳里、移动分段控件在视图里，
@@ -93,6 +126,17 @@ const curTab = computed(() => FEED_TABS.find((t) => t.key === active.value)!)
 
 async function syncFromRoute() {
   const t = route.query.tab
+
+  // 深链兜底：游客直接打开 /feed?tab=following（比如从别处分享来的链接）。
+  // **绝不能**让 setTab('following') 跑过去 —— 那个请求必然 401，
+  // 而 handleResponse 对任何 401 都会 clearTokens，等于"点个链接被登出"。
+  // 落回最新流并把 URL 里的 tab 抹掉，免得地址栏和画面对不上。
+  if (isTabKey(t) && requiresAuth(t) && !auth.isLoggedIn) {
+    router.replace({ path: '/feed' })
+    await setTab('latest')
+    return
+  }
+
   await setTab(isTabKey(t) ? t : 'latest')
 }
 
@@ -129,6 +173,11 @@ const cursorRows = computed<{ k: string; v: string }[]>(() => {
       { k: 'likes_count_before', v: show(st.cLikes) },
       { k: 'id_before', v: show(st.cID) },
     ]
+  }
+  // 关注流复用 cTime：它和最新流是**同一套游标协议**（毫秒），
+  // 这不是巧合，是后端刻意改的（原项目这条流用的是秒）
+  if (active.value === 'following') {
+    return [{ k: 'latest_time', v: st.cTime ? String(st.cTime) : '0（首页）' }]
   }
   return [
     { k: 'latest_popularity', v: show(st.cPopularity) },

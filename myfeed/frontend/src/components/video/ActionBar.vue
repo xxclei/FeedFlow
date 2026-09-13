@@ -1,31 +1,40 @@
 <template>
   <div class="bar">
     <!--
-      点赞/收藏是**禁用态 + 可见的角标文案**，不是 disabled 属性。
-      两个理由：
-        1. 移动端没有 hover，只写 title 的话手机上什么都看不到，只剩两个灰按钮；
-        2. disabled 会把元素从 tab 顺序里摘掉，键盘/读屏用户连 title 都够不着。
-      用 aria-disabled + 空操作，元素仍可聚焦、仍能读到 aria-label 里的说明。
+      点赞从阶段4 起是真的可用（后端 /like/like · /like/unlike 已注册）。
+
+      它是一个**开关按钮**，所以用 aria-pressed 而不是 aria-disabled ——
+      pressed 语义就是"按下去的状态"，读屏会念成"切换按钮，已按下"，
+      而 aria-disabled 的语义是"此按钮不可用"，两回事。
+      busy 时才用 aria-disabled（请求在飞、点了也没用），并且照样保留在
+      tab 顺序里：disabled 属性会把元素摘出去，键盘和读屏用户就够不着了。
+
+      收藏仍然是禁用态 + 角标文案，理由和之前一样：
+        1. 移动端没有 hover，只写 title 的话手机上什么都看不到；
+        2. disabled 会摘掉元素，读屏用户连说明都读不到。
     -->
     <button
-      class="act"
+      class="act like"
+      :class="{ on: isLiked }"
       type="button"
-      aria-disabled="true"
-      :aria-label="`点赞 ${likesCount}（阶段4接入）`"
-      title="阶段4接入（依赖 likes 模块，后端还没注册路由）"
-      @click="noop"
+      :aria-pressed="isLiked"
+      :aria-disabled="liking"
+      :aria-label="isLiked ? `取消点赞（当前 ${likesCount}）` : `点赞（当前 ${likesCount}）`"
+      :title="isLiked ? '取消点赞' : '点赞'"
+      @click="onLike"
     >
       <svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true">
+        <!-- 已赞时把图标填实（B 站的点赞图标也是实心/空心两态）：颜色之外再给一层
+             不依赖颜色的区分，色觉障碍用户也看得出来按没按下去 -->
         <path
           d="M7 10.5v9H4.6a1 1 0 0 1-1-1v-7a1 1 0 0 1 1-1zm0 0 4.3-7a1.6 1.6 0 0 1 2.9 1.3l-.9 3.7h5.2a1.7 1.7 0 0 1 1.7 2.1l-1.5 7a1.7 1.7 0 0 1-1.7 1.4H7"
-          fill="none"
+          :fill="isLiked ? 'currentColor' : 'none'"
           stroke="currentColor"
           stroke-width="1.7"
           stroke-linejoin="round"
         />
       </svg>
       <span>{{ likesCount }}</span>
-      <span class="soon">阶段4</span>
     </button>
 
     <button
@@ -94,20 +103,39 @@
 <script setup lang="ts">
 import { nextTick, ref } from 'vue'
 
-defineProps<{
+const props = defineProps<{
   likesCount: number
+  /** 我赞过没有。由父组件提供 —— 它可能来自 /like/isLiked，也可能是乐观更新的结果 */
+  isLiked: boolean
+  /** 点赞请求在飞。用来防连点：连点两下会发出 like + unlike，白白多一轮往返 */
+  liking?: boolean
   isOwner: boolean
   deleting?: boolean
 }>()
 
-defineEmits<{ (e: 'delete'): void }>()
+const emit = defineEmits<{
+  (e: 'toggle-like'): void
+  (e: 'delete'): void
+}>()
 
 const copied = ref(false)
 const manual = ref('')
 const manualEl = ref<HTMLInputElement | null>(null)
 
+/**
+ * 组件**不改状态、不发请求**，只把"用户点了"这件事报上去。
+ *
+ * 点赞的状态是"这个视频 + 我"的联合状态，父组件（详情页）才是它的所有者；
+ * 组件自己存一份的话，路由切到另一个视频时那份状态会留下来变成幽灵。
+ * 连点保护在这里做（纯 UI 关注点），对账和回滚在父组件做（业务关注点）。
+ */
+function onLike() {
+  if (props.liking) return
+  emit('toggle-like')
+}
+
 function noop() {
-  /* 禁用态：接口还不存在，什么都不做。文案在角标里 */
+  /* 收藏仍然是禁用态：后端没有对应接口 */
 }
 
 /**
@@ -176,6 +204,17 @@ function selectAll(e: FocusEvent) {
   background: var(--surface-2);
   border-color: var(--border);
 }
+/* 已赞：颜色 + 实心图标两重信号。注意样式挂在 .on 而不是 :aria-pressed 上 ——
+   aria-pressed 是给辅助技术读的语义，样式用类名，两者不混。 */
+.act.like.on {
+  color: var(--accent);
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
+}
+.act.like.on:hover {
+  border-color: var(--accent);
+}
+
 .act.danger {
   color: var(--danger);
   border-color: rgba(229, 83, 75, 0.4);
@@ -184,7 +223,9 @@ function selectAll(e: FocusEvent) {
   background: rgba(229, 83, 75, 0.1);
 }
 
-/* 阶段角标：和桌面频道条那个「关注 · 阶段6」是同一个说法的形态 */
+/* 阶段角标：用来标"这个功能后端还没有"。它现在只剩「收藏」一个使用者 ——
+   点赞（阶段4）、关注（阶段6）、评论（阶段5）都已经变成真按钮了。
+   阶段7+ 再冒出未接入的功能时，继续复用这套形态 */
 .soon {
   padding: 1px 6px;
   border-radius: 999px;

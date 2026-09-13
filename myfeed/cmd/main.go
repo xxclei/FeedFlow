@@ -35,7 +35,9 @@ func main() {
 	}()
 
 	// 5. 组装路由（依赖注入汇合点）并启动 HTTP 服务
-	r := myhttp.SetRouter(gormDB)
+	// 本轮起要往 router 传 cfg 了：检索的 depth / rrf_k 是纯配置，
+	// 没法从 db 派生出来（见 router.go 顶部注释）
+	r := myhttp.SetRouter(gormDB, cfg)
 	addr := fmt.Sprintf(":%d", cfg.Server.Port)
 	log.Printf("server listening on %s", addr)
 	if err := r.Run(addr); err != nil {

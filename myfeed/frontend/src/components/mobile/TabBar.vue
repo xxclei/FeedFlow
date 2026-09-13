@@ -70,7 +70,10 @@ const tabs: Tab[] = [
     // 未登录直接去登录页，省一次跳转守卫
     to: auth.isLoggedIn ? '/home' : '/login',
     path: 'M12 12.2a3.9 3.9 0 1 0 0-7.8 3.9 3.9 0 0 0 0 7.8M4.8 20.4c.9-3.6 3.8-5.6 7.2-5.6s6.3 2 7.2 5.6',
-    match: (r) => r.path === '/home' || r.path === '/login' || r.path === '/register',
+    // /likes 也算「我的」：它是从 /home 推进去的一层，属于这个 tab 的分支，
+    // 所以这里保持高亮（不像 /video/:id —— 那是从发现页推出去的，四个 tab 都不亮）
+    match: (r) =>
+      r.path === '/home' || r.path === '/likes' || r.path === '/login' || r.path === '/register',
   },
 ]
 </script>

@@ -1,6 +1,10 @@
 package feed
 
-import "time"
+import (
+	"time"
+
+	"myfeed/internal/search"
+)
 
 // FeedAuthor 作者信息（写时冗余，从 videos 表直接带出，不用查 accounts）
 type FeedAuthor struct {
@@ -16,7 +20,7 @@ type FeedVideoItem struct {
 	Description string     `json:"description,omitempty"`
 	PlayURL     string     `json:"play_url"`
 	CoverURL    string     `json:"cover_url"`
-	CreateTime  int64      `json:"create_time"` // Unix 毫秒
+	CreateTime  int64      `json:"create_time"` // **Unix 秒**（给前端 formatTime(sec) 用的展示值，不是游标）
 	LikesCount  int64      `json:"likes_count"`
 	IsLiked     bool       `json:"is_liked"` // 当前用户是否点过赞（阶段4接入，现在恒false）
 }
@@ -90,4 +94,39 @@ type ListByPopularityResponse struct {
 	NextLatestPopularity *int64     `json:"next_latest_popularity,omitempty"`
 	NextLatestBefore     *time.Time `json:"next_latest_before,omitempty"`
 	NextLatestIDBefore   *uint      `json:"next_latest_id_before,omitempty"`
+}
+
+// ---- 混合检索（词法 + 语义向量 + RRF 融合） ----
+
+type SearchRequest struct {
+	Query  string `json:"query"`
+	Limit  int    `json:"limit"`
+	Cursor string `json:"cursor"` // 上一页返回的 next_cursor，**原样回传**；首页不传，或传空串
+}
+
+// SearchResponse 搜索响应。
+//
+// ---------- 游标为什么是字符串 ----------
+//
+// 其它四条流的游标都是一组数值（时间戳/计数/id 的二元组三元组），前端要把它们
+// 原样存好再传回来。搜索不一样：融合结果的"位置"不是任何一列的取值，
+// 而是一份**冻结的排名快照**（理由见 search/cursor.go）。
+// 所以这里给前端的是一个不透明字符串 —— 前端不需要、也没法理解它的内容，
+// 这也正好让"以后换分页实现"不需要改前端。
+//
+// **注意翻页时查询词仍然要照传**（或者不传也行，见 handler 的说明）：
+// 服务端翻页不看它，但带着它能让日志/埋点里的上下文是完整的。
+type SearchResponse struct {
+	VideoList  []FeedVideoItem `json:"video_list"`
+	NextCursor string          `json:"next_cursor,omitempty"`
+	HasMore    bool            `json:"has_more"`
+
+	// Mode 本次实际跑成的形态（search.Mode 的说明写了每个取值的含义）。
+	//
+	// Arms / Total 和 Mode 一起构成**可观测性**：搜索"变差了"的时候，
+	// 这三个字段能立刻回答"是哪一路塌了、还是两路都跑了只是没命中"。
+	// 前端把它们放进调试面板 —— 这一页最有价值的不是搜索结果，是这三个数字。
+	Mode  search.Mode `json:"mode"`
+	Arms  search.Arms `json:"arms"`
+	Total int         `json:"total"` // 冻结列表的总长度（可翻的候选数，不是精确命中数）
 }

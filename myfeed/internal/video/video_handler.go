@@ -56,7 +56,7 @@ func (vh *VideoHandler) PublishVideo(c *gin.Context) {
 		CoverURL:    req.CoverURL,
 		CreateTime:  time.Now(),
 	}
-	if err := vh.service.Publish(c.Request.Context(), video); err != nil {
+	if err := vh.service.Publish(c.Request.Context(), video, req.TagNames); err != nil {
 		c.JSON(apierror.ClassifyHTTPStatus(err), gin.H{"error": err.Error()})
 		return
 	}
@@ -179,7 +179,12 @@ func (vh *VideoHandler) UploadCover(c *gin.Context) {
 	})
 }
 
-// DeleteVideo 删除视频（原项目有实现但路由里未挂载——死代码，保持对齐）
+// DeleteVideo 删除单条视频（JWT，路由 /video/delete）
+//
+// 这里原来挂着一句"原项目有实现但路由里未挂载——死代码，保持对齐"，是错的：
+// router.go 的 protectedVideoGroup 里一直挂着 /delete，这是**活代码**。
+// 顺带说清它与 DeleteVideosBatch 的分工：单条走这条（能报 404），
+// 批量走下面那条（只能报"跳过"），两者共用同一个删除实现。
 func (vh *VideoHandler) DeleteVideo(c *gin.Context) {
 	var req DeleteVideoRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -196,6 +201,57 @@ func (vh *VideoHandler) DeleteVideo(c *gin.Context) {
 		return
 	}
 	c.JSON(200, gin.H{"message": "video deleted"})
+}
+
+// DeleteVideosBatch POST /video/deleteBatch（JWT）
+//
+// 批量删除。返回 {deleted, deleted_ids, skipped_ids} —— 语义是**部分成功**，
+// 不属于自己的、以及已经不存在的 id 不报错，而是进 skipped_ids 如实回报。
+// 完整的理由见 entity.go 里 DeleteBatchResponse 的注释。
+//
+// ---------- 为什么这里的 400 是字面量，不走 apierror.ClassifyHTTPStatus ----------
+//
+// 本文件其它 handler 对 ShouldBindJSON 的失败统一写 ClassifyHTTPStatus(err)，
+// 而绑定错误**不是** apierror，于是落到默认分支变成 **500**：
+// 往 /video/publish 发一个 `{"title": 123}` 会得到"服务器内部错误"。
+// 那是一处既有的不一致（feed/handler.go 里后来加的校验一律用字面量 400）。
+// 新 handler 不复制它 —— 参数形状错误就是 400，不该让客户端以为是自己把服务打挂了。
+//
+// 也不引入 apierror.ErrValidation：它存在但全项目 0 使用，为一个 handler
+// 新开一条没人走过的错误路径不划算（而且它是 errors.New("validation error") 这种
+// 固定文案，直接用会把真实原因吞掉，必须 fmt.Errorf("%w") 包一层才行）。
+func (vh *VideoHandler) DeleteVideosBatch(c *gin.Context) {
+	var req DeleteBatchRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	authorId, err := jwt.GetAccountID(c)
+	if err != nil {
+		c.JSON(apierror.ClassifyHTTPStatus(err), gin.H{"error": err.Error()})
+		return
+	}
+
+	// service 里还会再 dedupeIDs 一次。这里先算，是为了让**上限判断的对象**
+	// 和真正要处理的集合一致：[5,5,5,...] 重复 200 次实际上只请求了 1 条，
+	// 按原始长度判会把它误拒成"一次删太多"
+	ids := dedupeIDs(req.IDs)
+	if len(ids) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "ids is required"})
+		return
+	}
+	// 封顶的理由是请求体大小 + 事务持有时间，不是"业务上不该一次删这么多"
+	if len(ids) > maxBatchDeleteIDs {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("too many ids (max %d)", maxBatchDeleteIDs)})
+		return
+	}
+
+	resp, err := vh.service.DeleteBatch(c.Request.Context(), ids, authorId)
+	if err != nil {
+		c.JSON(apierror.ClassifyHTTPStatus(err), gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(200, resp)
 }
 
 // ListByAuthorID POST /video/listByAuthorID（公开）
