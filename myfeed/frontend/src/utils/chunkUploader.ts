@@ -91,9 +91,19 @@ export async function uploadOneFile(
       signal,
     })
 
-    const uploaded = new Set(init.uploaded_chunks)
-    const resumedBytes = init.uploaded_chunks.reduce((n, i) => n + chunkSizeAt(file.size, i), 0)
-    if (resumedBytes > 0) hooks.onResume?.(resumedBytes, init.uploaded_chunks.length)
+    // ⚠ `?? []` 看着像多余的防御，但它买到的是"最坏情况退化成重传一遍"，
+    // 而不是"整个上传功能炸掉"。
+    //
+    // 契约上这个字段是列表，后端也已经在 UploadedChunks() 里补了
+    // （Go 的 nil slice 会编成 null 而不是 []，2026-09-15 上云当天在这里崩过：
+    //   Cannot read properties of null (reading 'reduce')）。
+    // 留着兜底是因为这里**没有中间地带**：null 进来，reduce 抛异常，
+    // 整个文件的上传当场死掉，而且报错信息（"reading 'reduce'"）指不到
+    // 是哪个字段、更指不到后端 —— 排查成本远大于这一行。
+    const uploadedChunks = init.uploaded_chunks ?? []
+    const uploaded = new Set(uploadedChunks)
+    const resumedBytes = uploadedChunks.reduce((n, i) => n + chunkSizeAt(file.size, i), 0)
+    if (resumedBytes > 0) hooks.onResume?.(resumedBytes, uploadedChunks.length)
 
     const missing: number[] = []
     for (let i = 0; i < total; i++) if (!uploaded.has(i)) missing.push(i)

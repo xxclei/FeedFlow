@@ -32,7 +32,12 @@ let refreshPromise: Promise<string | null> | null = null
 
 // 用 refreshToken 换新 accessToken。
 // isRefreshing/refreshPromise：并发多个 401 时只发一次 refresh，大家共享同一个 Promise（"单飞"）
-async function tryRefresh(): Promise<string | null> {
+//
+// **导出**是给 notification.ts 用的：SSE 那条长连接不走 fetch，401 只能靠
+// onerror 发现，所以它需要自己触发一次续期。让它复用这一份而不是抄一份 ——
+// 同后端 jwt.QueryTokenAuth 那条纪律：**鉴权逻辑不能有第二份实现**，
+// 抄一份的下场是两边对"什么算撤销"的判断慢慢分叉。
+export async function tryRefresh(): Promise<string | null> {
   const auth = useAuthStore()
   if (!auth.refreshToken) return null
   if (isRefreshing) return refreshPromise

@@ -18,6 +18,9 @@
 
         <div class="top-actions">
           <template v-if="auth.isLoggedIn">
+            <!-- 通知铃铛（阶段9）。**只在登录时渲染**，判断在组件自己里面 ——
+                 这样两个壳各写一行就有了一致的表现，不用在两处重复同一个 v-if -->
+            <NotificationBell />
             <RouterLink class="btn post-btn" to="/video">投稿</RouterLink>
             <RouterLink class="me" to="/home" title="账号">
               <span class="avatar" aria-hidden="true">{{ initial }}</span>
@@ -62,6 +65,7 @@ import { computed, ref } from 'vue'
 import { RouterLink, useRoute, useRouter } from 'vue-router'
 
 import { logout } from '../api/account'
+import NotificationBell from '../components/NotificationBell.vue'
 import { useAuthStore } from '../stores/auth'
 
 const auth = useAuthStore()

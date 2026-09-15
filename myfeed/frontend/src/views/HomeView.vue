@@ -49,6 +49,16 @@
           <span class="phase">扩展</span>模糊检索（MySQL FULLTEXT + ngram）——
           <RouterLink to="/search?q=日常">试试搜「日常」</RouterLink>
         </li>
+        <!-- 同一个「扩展」段的第二块：播放质量埋点（QoE）。它排在最前面做，
+             不是因为功能最亮眼，而是因为**它是后面那些改动的仪表盘** ——
+             上传门禁、多档 HLS、过载降级每一步都要拿"改之前"的数字做对比，
+             而基线只能在那之前测。链接进的是看板，不是"我的"内容，
+             所以刻意没放进上面那个「我的内容」按钮组 -->
+        <li class="done">
+          <span class="phase">扩展</span>播放质量埋点（QoE）——
+          <RouterLink to="/qoe">看板</RouterLink>
+          <span class="text-muted">（播一条视频后数字才会动）</span>
+        </li>
         <li><span class="phase">阶段 7</span>三级缓存与限流</li>
         <li><span class="phase">阶段 8</span>热门榜 Redis 快照</li>
         <li><span class="phase">阶段 9+</span>实时通知</li>

@@ -16,6 +16,19 @@ export interface VideoItem {
   create_time: string
   likes_count: number
   popularity: number
+
+  /**
+   * 转码状态。**这里是必填**（和 `FeedVideoItem` 上的可选形成对照）：
+   * `/video/*` 的响应是后端把裸 `Video` struct 直接 `c.JSON` 出去的，
+   * 那两个字段的 json tag **没有** omitempty，所以**一定**在响应里。
+   * 写成可选就等于假装它可能缺失，读的地方就得写一堆 `?? ''`。
+   *
+   * 六个取值见后端 entity.go。播放端只认 `'ready'`。
+   */
+  transcode_status: string
+
+  /** HLS master playlist 的**路径**；非空即可走 HLS。语义详见 `FeedVideoItem.hls_url`。 */
+  hls_url: string
 }
 
 /**
@@ -144,11 +157,30 @@ export function normalizeVideo(v: VideoItem): FeedVideoItem {
     create_time: isoToUnixSeconds(v.create_time),
     likes_count: v.likes_count,
     is_liked: false,
+    // 阶段 D：两个转码字段原样透传，**不做任何加工**。
+    // 尤其不要把 hls_url 换成 staticURL 的结果 —— 这个函数在详情页和
+    // 相关推荐两处都被调用，将来还可能被别的地方调；换 URL 是**播放器**的事，
+    // 它最清楚自己是走 HLS 还是直传。这里一换，别处再拿这个字段做判断
+    // （比如"有没有 HLS"）就会得到"有，但已经是相对路径了"这种半成品。
+    transcode_status: v.transcode_status,
+    hls_url: v.hls_url,
   }
 }
 
 // 后端返回的是绝对地址 http://localhost:8080/static/...，
 // 换成同源相对路径（经 vite 代理），播放/画布截帧都不受跨域影响
+//
+// ⚠ **它只返回 `pathname`，query 和 hash 会被丢掉。**
+//
+// 这在当前所有调用点上都没问题（`.mp4` / 封面 / `master.m3u8` 都是纯路径），
+// 但它是一条**没写在函数签名里**的限制 —— 将来谁传一个带签名的 URL
+// （`?token=...&expires=...`，对象存储/CDN 的常见做法）进来，
+// 就会得到一个**少了一半的地址**，而表现是 403 或 404，不是"参数丢了"。
+//
+// 之所以不"顺手修好"（改成 `pathname + search`）：本项目的静态资源全部同源、
+// 全部不带 query，改成带 search 会引入一个**当前没有读者**的分支。
+// 假旋钮比缺功能更难查（见 config.yaml 里同样的判断）。
+// 要用带参数的 URL 时，在这里加，并且同时补一个测试。
 export function staticURL(url: string): string {
   try {
     const u = new URL(url, window.location.origin)

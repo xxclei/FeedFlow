@@ -58,7 +58,24 @@
                而不是藏起来（按钮自己处理这件事，见 FollowButton.vue） -->
           <div class="actions">
             <p v-if="isSelf" class="self text-muted">这是你自己的主页。</p>
-            <FollowButton v-else :vlogger-id="profile.account.id" />
+            <template v-else>
+              <FollowButton :vlogger-id="profile.account.id" />
+              <!-- 私信（阶段12）。两道判断，理由不同：
+                     isSelf     → 自己的主页不显示（"给自己发私信"不是个功能）；
+                     isLoggedIn → 游客不显示。**这里和「关注」的处理刻意不同**：
+                                  关注失败了能就地提示登录，人还停在原地；
+                                  而 /messages 有 requiresAuth，游客点它会被守卫
+                                  直接踢到 /login，登录完落回的是 /feed 而不是
+                                  这条私信 —— 一次"跳走就回不来"的跳转，
+                                  不如一开始就不给这个按钮。 -->
+              <RouterLink
+                v-if="auth.isLoggedIn"
+                class="msg"
+                :to="`/messages/${profile.account.id}`"
+              >
+                私信
+              </RouterLink>
+            </template>
           </div>
         </div>
 
@@ -360,6 +377,27 @@ h1 {
 }
 .actions {
   margin-top: 4px;
+}
+/* 「私信」和 FollowButton 是**行内并排**的（.actions 不是 flex 容器，
+   所以它们按 inline-flex 自然排在一行，中间那个词间空格就是间距的来源）。
+   不把它做成 flex 容器：FollowButton 的模板根是个 fragment
+   （button + 失败提示那个 <p>），一旦 .actions 变成 flex，
+   那条提示会变成并排的第三个 flex item，挤到按钮右边去 */
+.msg {
+  display: inline-flex;
+  align-items: center;
+  min-height: 38px;
+  margin-left: 8px;
+  padding: 0 16px;
+  border: 1px solid var(--border);
+  border-radius: 11px;
+  background: var(--surface-2);
+  font-size: 0.88rem;
+  font-weight: 600;
+}
+.msg:hover {
+  border-color: var(--border-strong);
+  color: var(--ink);
 }
 .self {
   margin: 0;

@@ -8,6 +8,11 @@
         </RouterLink>
 
         <div class="actions">
+          <!-- 通知铃铛（阶段9）。和桌面壳共用同一个组件，面板是右上角浮层 ——
+               移动端**没有**给它单开一个底部 Tab：Tab 栏那四格表达的是
+               "页面的四个去处"，而通知是一个**状态**（未读红点），
+               塞进 Tab 栏反而要给它加一个新概念"带角标的 Tab" -->
+          <NotificationBell />
           <button class="icon-btn" type="button" aria-label="搜索" @click="toggleSearch">
             <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
               <circle cx="11" cy="11" r="6.5" fill="none" stroke="currentColor" stroke-width="2" />
@@ -53,6 +58,7 @@
 import { nextTick, ref } from 'vue'
 import { RouterLink, useRouter } from 'vue-router'
 
+import NotificationBell from '../components/NotificationBell.vue'
 import TabBar from '../components/mobile/TabBar.vue'
 import { useAuthStore } from '../stores/auth'
 
@@ -137,6 +143,13 @@ function onSearch() {
 }
 .icon-btn:hover {
   background: var(--surface-2);
+}
+/* 铃铛在桌面顶栏是 38px（顶栏才 58px 高），移动端得够到 DESIGN.md 那条
+   44px 触控下限 —— 它和旁边两个 icon-btn 是同一排，尺寸不齐会很明显。
+   组件样式是 scoped 的，只能从外面用 :deep 顶进去 */
+.actions :deep(.bell) {
+  width: 44px;
+  height: 44px;
 }
 
 .search-row {

@@ -42,9 +42,11 @@
              旧元素卸载会走 onUnmounted 里的三步释放，解码器不会跟着漏 -->
         <VideoPlayer
           :key="video.play_url"
+          :video-id="video.id"
           :play-url="video.play_url"
           :cover-url="video.cover_url"
           :title="video.title"
+          :hls-url="video.hls_url"
         />
 
         <h1 class="title">{{ video.title }}</h1>

@@ -14,6 +14,7 @@ import { chunkCount, fingerprintFile, type FileFingerprint } from '../utils/hash
 import { Semaphore } from '../utils/pool'
 import { isAbort, withRetry } from '../utils/retry'
 import { normalizeTagNames } from '../utils/tags'
+import { newId } from '../utils/uuid'
 import { useAuthStore } from './auth'
 
 /** 文件级并行度。每个文件内部还有 3 条分片泳道，总在途由全局闸门压住 */
@@ -175,7 +176,12 @@ export const useUploadQueueStore = defineStore('uploadQueue', () => {
     const created: QueueItem[] = []
     for (const p of accepted) {
       const item: QueueItem = {
-        id: crypto.randomUUID(),
+        // 用 utils/uuid.ts 的 newId()，**不要**直接写 crypto.randomUUID()：
+        // 那个方法只在安全上下文（https / localhost）里存在，
+        // 而这个站现在是 http://<公网IP> 跑着的 —— 2026-09-15 上云当天
+        // 就是这一行报的 "crypto.randomUUID is not a function"，
+        // 表现是"选完文件点上传，队列里一个条目都不出现"。
+        id: newId(),
         filename: p.file.name,
         relPath: p.relPath,
         size: p.file.size,

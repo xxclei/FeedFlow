@@ -13,13 +13,31 @@ import type { FeedVideoItem } from './feed'
  * - `ngram`        词法跑了 FULLTEXT + ngram，且每个词都必须出现（AND）
  * - `ngram-or`     AND 命中不够，退成了 OR（更宽，相关度也更松）
  * - `like`         查询词太短（< ngram_token_size=2），FULLTEXT 索引永远匹配不到，
- *                  所以走了 LIKE 全表扫。**单字搜索靠的就是这条**
+ *                  所以走了 LIKE 全表扫。**单字搜索靠的就是这条**，是预期行为
+ * - `like-fallback` 查询词**够长却零命中**，词法退成 LIKE 兜底 —— 这一档要
+ *                  当成**索引可疑**的告警看：ngram 的停用词过滤把 bigram
+ *                  削掉了（"java" 的 ja/av/va 全含字母 a，一个都不剩）、
+ *                  ngram_token_size 被人改过、或者索引建完没重建。
+ *                  它和 `like` 都会返回结果，区别在于**排查方向完全不同**：
+ *                  `like` 没事可修，`like-fallback` 说明索引该重建了。
+ *                  后端那边对应 video/search_index.go 的坑 #2 / #5
  * - `lexical-only` 向量那一路没启用或挂了（本轮恒是这个之外的取值，见下）
  * - `vector-only`  词法那一路不可用（FULLTEXT 索引没建成功）
  *
- * 本轮后端只接了词法那一路，所以**实际只会出现前三个**。
+ * ⚠ **本轮实际只会看到 `lexical-only` 一个值。** 不是这里列错了，是后端
+ * service.go 的那段 switch：它只判断"哪几路跑了"，`runVec` 为 false 时
+ * 直接给 `lexical-only` 并**丢掉词法那一路自己的形态**。
+ * 而本轮向量那一路没接线（router.go 里 `NewService(lex, nil, nil, nil, ...)`
+ * 那三个 nil），所以 runVec 恒为 false —— 上面 ngram / ngram-or / like /
+ * like-fallback 这四个在调试面板上**一次都不会出现**。
+ *
+ * 这条**已知**：它让"搜索为什么搜不到"这类问题少了一个现成的读数
+ * （真拿到过 `like-fallback` 的话，一眼就能看出索引可疑）。
+ * 要修就得让 mode 能同时表达"哪几路跑了"和"词法那一路跑成什么形态"，
+ * 那是给 Result 加字段、并且要连着改 cursor（Mode 会被冻结进游标）——
+ * 不是一行的事，先记在这里不顺手改。
  */
-export type SearchMode = 'ngram' | 'ngram-or' | 'like' | 'lexical-only' | 'vector-only'
+export type SearchMode = 'ngram' | 'ngram-or' | 'like' | 'like-fallback' | 'lexical-only' | 'vector-only'
 
 /** 两路各召回了多少条候选。这一页最有价值的数字就是它 */
 export interface SearchArms {

@@ -23,6 +23,34 @@ export interface FeedVideoItem {
   create_time: number // Unix 秒（后端 .Unix()）
   likes_count: number
   is_liked: boolean // 阶段4已接入：登录用户是真值；游客恒 false（后端拿不到"我"是谁）
+
+  /**
+   * 转码状态：""（改造前的存量行）/ "pending" / "running" / "ready" / "failed" / "skipped"。
+   *
+   * 六个取值的完整语义见后端 entity.go；播放端只关心**一个**：`=== 'ready'`。
+   * 其余全部走直传老路（`skipped` 是"门禁判定不需要转码"，走直传是它的正常态，
+   * 不是降级）。
+   *
+   * 为什么是可选（`?`）而不是必填：这个接口的响应来自 `/feed/*`，
+   * 而 `/feed/*` 用的是**另一个**实体类型（feed 包的），不保证带这两个字段。
+   * 详情页那条路（`/video/getDetail`，裸 Video struct → 一定带）
+   * 由 `api/video.ts` 的 `VideoItem` 负责，那边是必填。
+   */
+  transcode_status?: string
+
+  /**
+   * HLS 的 master playlist 路径（`/static/hls/<id>/master.m3u8`），**非空即代表可以走 HLS**。
+   *
+   * 后端的不变量：这一列**只在 `transcode_status='ready'` 时**才非空
+   * （转码开始 / 失败都显式写空串，见 transcode_worker.go）。
+   * 所以播放端判断"能不能用 HLS"只认它一个，不必再去看状态 ——
+   * 两个字段各判一次的话，早晚会出现两边不一致的分支，
+   * 而那个分支的表现是"明明转好了却在直传"或者反过来"指向一个不存在的 playlist"。
+   *
+   * 它是**路径**不是完整 URL（后端刻意这么存，换域名/CDN 时只改前端一处）。
+   * 纯路径、不带 query/hash —— 这一点是必须的，见 `staticURL` 的说明。
+   */
+  hls_url?: string
 }
 
 // ---- 最新流：单值游标（毫秒） ----

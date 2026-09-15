@@ -35,6 +35,27 @@ const router = createRouter({
       meta: { requiresAuth: true },
     },
     {
+      // 播放质量看板（QoE 扩展）。**刻意不加 requiresAuth** —— 判据和
+      // /search、/video/:id 一致：**跟后端接口的鉴权级别走**。
+      // /qoe/stats 挂的是 SoftJWTAuth（router.go 里 qoeGroup 那一组），
+      // 而且它只返回聚合分布、不含任何用户维度（后端 qoe/handler.go 里
+      // "stats 为什么也公开"那段讲清了这条边界），所以游客也该能看。
+      //
+      // 和 /home 的区别值得注意：**入口在 /home（要登录），但这一页本身不要**
+      // —— 这不是矛盾，是"链接放哪"和"页面要什么权限"两件事。
+      // 现在从 /home 点进来，直接贴 URL 也能进。真哪天想把它收成内部页，
+      // 改动点是这里加一行 meta，而不是去动后端。
+      //
+      // ⚠ 也**不在 00-12 那条路线上**：howto 那 13 篇文档里没有埋点/观测这一章，
+      // 和 /search 一样属于「扩展」，所以没有"阶段 N"的编号。
+      //
+      // 条件走 query（?v=视频ID&d=天数），和 /search 的 ?q= 同一个理由：
+      // 这一页的主要用途是"改动前后各看一次"，条件必须能收藏、能分享 ——
+      // 阶段 E 验收要对比的「降级开 vs 关」就是同一串 query 换一个 d。
+      path: '/qoe',
+      component: () => import('../views/QoeStatsView.vue'),
+    },
+    {
       path: '/video',
       component: () => import('../views/VideoView.vue'),
       meta: { requiresAuth: true },
@@ -66,6 +87,31 @@ const router = createRouter({
     },
     // 刻意**没有** /following 这条路由：关注流是 /feed 页面的第四个 tab
     // （/feed?tab=following），不是独立页面。理由写在 DesktopShell.vue 的 channels 上。
+    {
+      // 私信（阶段12）。**要登录**：/message 两个接口都挂 JWTAuth，
+      // 而且发送者只从 JWT 取（请求体里根本没有 from_id）——
+      // "我发的私信"没有"我"同样不成立，和 /likes 同一支。
+      //
+      // 这一条和下面那条**指向同一个组件**，区别只在有没有 peerId。
+      // 用两条路由而不是一条可选参数（/messages/:peerId?）：可选参数在
+      // vue-router 里表达成"要么有要么没有"，但这两屏在移动端是
+      // **完全不同的两屏**（联系人列表 / 聊天窗），分开写守卫和标题都更直白。
+      path: '/messages',
+      component: () => import('../views/MessageView.vue'),
+      meta: { requiresAuth: true },
+    },
+    {
+      // 和某人的聊天窗。peerId 是**对方**的账号 ID，从来不是"会话 ID" ——
+      // 后端那张表只有消息、没有会话（见 message/entity.go 的说明），
+      // 所以会话是用 `(from,to) OR (to,from)` 推算出来的，前端这边
+      // 也就只需要记住"对方是谁"。
+      //
+      // 传一个不存在的账号 ID 不会 404（后端只查消息，不校验账号是否存在），
+      // 表现是一个空会话 —— 这是后端的事实，前端不额外拦。
+      path: '/messages/:peerId',
+      component: () => import('../views/MessageView.vue'),
+      meta: { requiresAuth: true },
+    },
   ],
   /**
    * 回退时还原滚动位置。
