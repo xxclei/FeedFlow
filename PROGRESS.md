@@ -3,9 +3,13 @@
 > 对照 `howto_feed-rebuild/README.md` 的复刻总路线图，完成一个阶段就把状态列改掉。
 > 规则：按顺序推进，每个阶段验收清单全过、`git commit` 之后才算完成。
 
-- 当前进度：**阶段 0~6 全部已提交**（含本轮扩展：批量标签 / 批量删除 / 模糊检索 / 播放页），提交 `e960d69`，2026-09-13。
+- 当前进度：**阶段 0~12 全部已提交**，另含两个不在路线图上的扩展（模糊检索 / 播放体验）。
+  阶段 0~6 见 `2dbf866`；阶段 7~12 与两个扩展是连续写完的，按后端/前端/部署/文档
+  四个维度分别提交：`9b989a2`(后端) `222dc5b`(前端) `167fa4c`(部署) `ed586ef`(文档)。
+  2026-09-15。
 - 新项目代码：`myfeed/`（后端）+ `myfeed/frontend/`（Vue3 前端，随模块生长）
-- 参考答案：`origin-feed-project_example/feedsystem_video_go/`
+- 参考答案：`origin-feed-project_example/feedsystem_video_go/` —— **只在本地，不在版本库里**
+  （上游源码无 LICENSE，2026-09-15 已从历史中清除）
 
 ## 路线图
 
@@ -14,16 +18,16 @@
 | 0 | 架构与环境准备 | [00](howto_feed-rebuild/00-架构与环境准备.md) | ✅ 2026-09-10 | `go run ./cmd` 起服务，MySQL 表自动创建 |
 | 1 | 账号模块 | [01](howto_feed-rebuild/01-账号模块.md) | ✅ 2026-09-10 | Postman 走完注册→登录→带 token 访问 |
 | 2 | 视频模块 | [02](howto_feed-rebuild/02-视频模块.md) | ✅ 2026-09-12 | 直传/分片上传/发布事务/outbox；前端发布页可传可播 |
-| 3 | Feed 模块 | [03](howto_feed-rebuild/03-Feed模块.md) | ✅ 已验收（提交 `c57fa91`） | 三种游标翻页不重不漏；游客可刷流 |
-| 4 | 点赞模块 | [04](howto_feed-rebuild/04-点赞模块.md) | ✅ 已验收（提交 `e960d69`） | 计数正确，重复点赞被拦截 |
-| 5 | 评论模块 | [05](howto_feed-rebuild/05-评论模块.md) | ✅ 已验收（提交 `e960d69`） | 只有作者能删评论；@提及写 notifications 行 |
-| 6 | 关注模块 | [06](howto_feed-rebuild/06-关注模块.md) | ✅ 已验收（提交 `e960d69`） | 关注后关注流出现对方视频 |
-| 7 | Redis 缓存 | [07](howto_feed-rebuild/07-Redis缓存.md) | ⬜ 未开始 | 停 Redis 业务不挂；redis-cli 能看到 key |
-| 8 | 热榜 | [08](howto_feed-rebuild/08-热榜.md) | ⬜ 未开始 | 翻页榜单不抖；停 Redis 降级 MySQL |
-| 9 | RabbitMQ 与 Worker | [09](howto_feed-rebuild/09-RabbitMQ与Worker.md) | ⬜ 未开始 | 点赞秒回异步落库；停 MQ 直写兜底 |
-| 10 | Docker 部署 | [10](howto_feed-rebuild/10-Docker部署.md) | ⬜ 未开始 | `docker compose up -d --build` 全部起来 |
-| 11 | 前端总装 | [11](howto_feed-rebuild/11-前端.md) | 🔶 随行完成约 90%（骨架/登录/发布页/分片上传/批量投稿/发现页/标签流/端上分流/播放页/检索页/通知中心/私信页已就绪） | 浏览器完整走一遍用户旅程 |
-| 12 | 私信与 SSE 实时通知 | [12](howto_feed-rebuild/12-私信与SSE实时通知.md) | 🔶 代码完成并实测（2026-09-14），**未在真浏览器点过** | 两个账号互发私信；点赞触发实时通知 |
+| 3 | Feed 模块 | [03](howto_feed-rebuild/03-Feed模块.md) | ✅ 已验收（提交 `72491d0`） | 三种游标翻页不重不漏；游客可刷流 |
+| 4 | 点赞模块 | [04](howto_feed-rebuild/04-点赞模块.md) | ✅ 已验收（提交 `2dbf866`） | 计数正确，重复点赞被拦截 |
+| 5 | 评论模块 | [05](howto_feed-rebuild/05-评论模块.md) | ✅ 已验收（提交 `2dbf866`） | 只有作者能删评论；@提及写 notifications 行 |
+| 6 | 关注模块 | [06](howto_feed-rebuild/06-关注模块.md) | ✅ 已验收（提交 `2dbf866`） | 关注后关注流出现对方视频 |
+| 7 | Redis 缓存 | [07](howto_feed-rebuild/07-Redis缓存.md) | ✅ 2026-09-14（提交 `9b989a2`） | 停 Redis 业务不挂；redis-cli 能看到 key |
+| 8 | 热榜 | [08](howto_feed-rebuild/08-热榜.md) | ✅ 2026-09-14（提交 `9b989a2`） | 翻页榜单不抖；停 Redis 降级 MySQL |
+| 9 | RabbitMQ 与 Worker | [09](howto_feed-rebuild/09-RabbitMQ与Worker.md) | ✅ 2026-09-14（提交 `9b989a2`） | 点赞秒回异步落库；停 MQ 直写兜底 |
+| 10 | Docker 部署 | [10](howto_feed-rebuild/10-Docker部署.md) | ✅ 2026-09-15，已上线公网（提交 `167fa4c`） | `docker compose up -d --build` 全部起来 |
+| 11 | 前端总装 | [11](howto_feed-rebuild/11-前端.md) | 🔶 随行完成约 95%（骨架/登录/发布页/分片上传/批量投稿/发现页/标签流/端上分流/播放页/检索页/通知中心/私信页已就绪）（提交 `222dc5b`） | 浏览器完整走一遍用户旅程 |
+| 12 | 私信与 SSE 实时通知 | [12](howto_feed-rebuild/12-私信与SSE实时通知.md) | ✅ 代码完成并实测（2026-09-14），**未在真浏览器点过**（提交 `9b989a2` `222dc5b`） | 两个账号互发私信；点赞触发实时通知 |
 
 **扩展（不在上面这条路线上）**：模糊检索 —— `FULLTEXT + ngram` 词法那一路，2026-09-13。
 howto 那 13 篇文档一份都没提检索（`grep -rln "FULLTEXT\|ngram" howto_feed-rebuild/*.md` 零命中），
