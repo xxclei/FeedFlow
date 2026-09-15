@@ -1,0 +1,62 @@
+# 前端镜像：nginx 服务 SPA 产物 + 反代后端。
+#
+# 两个阶段：node 里构建 dist → nginx:alpine 里只放产物和配置。
+# 最终镜像里**没有 node、没有 node_modules、没有源码**，只有 1.3 MB 的 dist。
+#
+# node 版本对齐开发机（v24）：`vite: ^8.3.0` 是本项目依赖里对 Node 版本最敏感的
+# 一个，容器里用别的版本意味着"本机 build 过、服务器上 build 失败"这类
+# 只在部署时出现的问题。要升级 Node 时**两边一起升**。
+
+# ========== 构建阶段 ==========
+FROM node:24-alpine AS build
+
+WORKDIR /web
+
+# 和 Go 那边同一个套路：先 COPY 依赖清单再 npm ci，
+# 这样改前端代码不会让"装依赖"这一层缓存失效。
+#
+# 用 `npm ci` 而不是 `npm install`：前者严格按 package-lock.json 装，
+# 装出来的树和开发机一致；后者会顺手更新 lock 文件，
+# 于是"服务器上装出来的版本"和"你测过的版本"可以不一样 —— 而且不留痕迹。
+COPY frontend/package.json frontend/package-lock.json ./
+
+# ---------- 换成国内 npm 源（和 Go 那边同一个原因）----------
+#
+# registry.npmjs.org 在大陆能用但很慢、而且会间歇性超时。
+# npmmirror 是阿里维护的完整镜像，同步频率很高。
+#
+# ⚠ 一个容易踩的点：package-lock.json 里**每个包的 resolved 字段都写死了
+#   https://registry.npmjs.org/...** 的完整 URL。所以"改了 registry 到底有没有用"
+#   曾经是个真问题 —— npm 8 之后有个 replace-registry-host 配置（默认值 npmjs），
+#   会把 lock 文件里指向官方源的 URL **自动替换**成你配的这个源。
+#   也就是说下面这行是生效的。
+#   万一将来它没生效（卡在 registry.npmjs.org 上），后手是：
+#   把 package-lock.json 里的 resolved 字段删掉再装。
+#
+# 用 `npm config set` 而不是 `npm ci --registry=...`：前者是持久的，
+# 装依赖过程中任何子进程（postinstall 之类）再发起的请求也会走这个源。
+RUN npm config set registry https://registry.npmmirror.com \
+ && npm ci
+
+COPY frontend/ ./
+
+# 跑的是 package.json 里的 build = `vue-tsc -b && vite build`。
+# **类型检查在构建里**，所以前端有类型错误时镜像根本构不出来 ——
+# 这正是想要的：与其部署一个"能跑但类型不对"的产物，不如在这里失败。
+WORKDIR /web
+RUN npm run build
+
+# ========== 运行阶段 ==========
+FROM nginx:alpine
+
+# 覆盖默认站点配置（nginx:alpine 默认会读 /etc/nginx/conf.d/default.conf）。
+# 我们的那份里有三件默认配置没有的事：/api 去前缀、/static 透传、
+# 以及 SPA 的 try_files 回退 —— 而第三件**必须有**：
+# Go 侧完全没有这个路由（没有 go:embed、没有 NoRoute 处理器），
+# 少了它，直接访问 /qoe 或刷新 /video/3 就是 nginx 的 404 页面。
+COPY deploy/nginx.conf /etc/nginx/conf.d/default.conf
+
+COPY --from=build /web/dist /usr/share/nginx/html
+
+ENV TZ=Asia/Shanghai
+EXPOSE 80

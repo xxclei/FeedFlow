@@ -1,0 +1,314 @@
+# myfeed 整栈编排（单机）。**上云用这个文件**。
+#
+# 和 deploy/docker-compose.deps.yml 的分工：
+#   那个 = 开发用的**依赖**（只起 mysql/redis/rabbitmq，端口映射到宿主机，
+#          应用在宿主机上 go run / vite dev，改代码不用重建镜像）
+#   这个 = **整栈**，六个服务全在容器里，只有 nginx 对公网开端口
+# 两个都留着。开发用旧的（快），部署用这个。
+#
+# ---------- 密码从哪来 ----------
+#
+# 下面所有 `${VAR}` 是 **compose 在解析本文件时**用 deploy/.env 替换的，
+# 不是容器里的 shell 展开。所以：
+#
+#     cp deploy/.env.example deploy/.env     # 然后改成真密码
+#     docker compose -f deploy/docker-compose.prod.yml up -d --build
+#
+# （.env 和本文件同目录时 compose 会自动读。上面命令里的路径写全，
+#   是为了让"配置从哪来"在命令里就能看见。）
+#
+# ⚠ **一处必须记住的重复**：mysql/redis/rabbitmq 的密码同时存在于
+#   ① deploy/.env（给容器本身用）② configs/config.prod.yaml（给 Go 用，
+#   因为 config.Load 只读 yaml、不做环境变量替换）。
+#   改密码是**改两处**，漏一处的表现见 config.prod.example.yaml 顶部。
+
+# 项目名。**必须显式写**：默认值是"compose 文件所在目录名"，而
+# docker-compose.deps.yml 也在 deploy/ 下 —— 两个文件会共用同一个项目名
+# `deploy`，于是 `-f deps.yml up` 和 `-f prod.yml up` 会互相认领对方的容器，
+# 甚至把开发用的 mysql 容器给"删掉重建"。显式起名之后两边彻底分开。
+name: myfeed-prod
+
+# Docker 默认**不轮转**容器日志（json-file 无限增长）。云盘按容量计费，
+# 而 api 每次请求都有日志、mysql 也有自己的输出 —— 不设这个，
+# 一个跑几个月的 2 核机是被日志撑满的，且不会有人注意到。
+# 用 YAML 锚点写一次，六个服务都引用它。
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  # ============================================================
+  # 依赖层：**一个端口都不对公网发布**
+  # ============================================================
+  #
+  # `expose` 只写"这些端口是给同网络的服务用的"，实际不做端口发布；
+  # `ports` 才是发布。开发那份编排里 mysql 是 `3307:3306`、redis 是
+  # `6379:6379` —— 在宿主机上那样写没问题，**搬到有公网 IP 的机器上
+  # 就是把 root/123456 的 MySQL 和带弱密码的 Redis 直接挂在公网**。
+  # 这类实例被扫到之后通常在几小时内开始挖矿，而且几乎必然发生。
+  # 所以下面六个服务里，**只有 nginx 有 ports:**。
+  # （技术说明：同网络内容器本来就能互通，expose 是给读的人看的声明。）
+
+  mysql:
+    image: mysql:8.0
+    restart: unless-stopped
+    logging: *default-logging
+    expose:
+      - "3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: myfeed
+      # 时区三件套之一。见 config.prod.example.yaml 顶部那一大段：
+      # 这里不设，NOW() / CURRENT_TIMESTAMP 会按 UTC 走，
+      # 而 Go 那边按 Asia/Shanghai 写 —— 新数据会比旧数据早 8 小时，
+      # feed 按 create_time DESC 排序时**新视频永远排在最后**，且不报错。
+      TZ: Asia/Shanghai
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      # 显式写死时区，不依赖镜像里有没有 tzdata。
+      # `TZ` 环境变量要生效需要容器里有 /usr/share/zoneinfo 且 mysql 读它；
+      # 而 `default-time-zone` 是 MySQL 自己的启动参数，用**偏移量**形式
+      # 不需要 mysql_tzinfo_to_sql 导入时区表。两条一起写：一条管进程环境、
+      # 一条管 SQL 语义，任一条失效另一条还能兜住。
+      - --default-time-zone=+08:00
+      # ngram_token_size 是**只读启动变量**（SET 改不了，会话里改会直接报错）。
+      # 现在它是 InnoDB 的默认值 2 —— 也就是说索引现在的正确性是
+      # "靠默认值碰巧对"。写进启动参数才是结构上的保证。
+      # 改这个值必须重建全文索引（search_index.go 的指纹机制会检测到并重建）。
+      - --ngram_token_size=2
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      # `$$` 是给 compose 的转义：compose 把 `$$` 变成 `$`，容器里的 sh
+      # 再展开成真密码。单写 `$MYSQL...` 会被 compose 自己吃掉（展开成空）。
+      test: ["CMD-SHELL", "mysqladmin ping -h127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      # mysql 首次启动要初始化数据目录（建系统表 + 建 myfeed 库），
+      # 2 核机上要几十秒。start_period 里的失败**不计入** retries ——
+      # 不写它的话，容器会因为"启动太慢"被标成 unhealthy，
+      # 然后 api 的 depends_on 永远等不到 healthy，整个栈卡住。
+      start_period: 60s
+    # 2 核 2G 上必须给依赖层设上限。不设的话某个服务涨上去之后
+    # 被内核 OOM killer 挑中的是**随机的** —— 可能把 api 干掉而留下 mysql。
+    mem_limit: 768m
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    logging: *default-logging
+    expose:
+      - "6379"
+    environment:
+      TZ: Asia/Shanghai
+    # 开 AOF 的理由**不是正确性**：这个项目里 Redis 存的都是可重建的东西 ——
+    # 连最敏感的"token 撤销名单"也有 DB 兜底（jwt.go 的 check 三步走，
+    # 第③步查库），Redis 空了只会多打一次库，不会放行已撤销的 token。
+    #
+    # 开它是为了**避免每次重启都把缓存打回冷启动**：本项目实测过缓存击穿
+    # （防击穿锁在 DB 慢到 150ms 时反而更慢，见 PROGRESS 阶段 7）。
+    # 每次 `up -d --build` 都清空一次缓存，正好是最容易撞上它的时刻。
+    # 代价是每次写多一次落盘，对一个只做缓存的 2 核机可以忽略。
+    command: redis-server --requirepass ${REDIS_PASSWORD} --appendonly yes
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      # 用 exec 形式（不是 CMD-SHELL），密码作为独立 argv 传进去，
+      # 不经过任何 shell —— 密码里有 shell 元字符也不会出错。
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    mem_limit: 256m
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    restart: unless-stopped
+    logging: *default-logging
+    expose:
+      - "5672"
+    ports:
+      # ⚠ 这条**不是**发布到公网：绑的是 127.0.0.1，只有本机（也就是
+      # 通过 SSH 隧道进来的人）能访问。管理界面是这个项目一直在用的
+      # 排障工具（QueueInspect / 看 messages 堆积），云上不给它留个口
+      # 就只能靠 rabbitmqctl，排查成本高很多。
+      #
+      # 用法：本机开 `ssh -L 15672:127.0.0.1:15672 root@<公网IP>`，
+      # 然后浏览器打开 http://localhost:15672。
+      # （15672 管理端口是 HTTP，**绝不要**把它发布成 0.0.0.0）
+      - "127.0.0.1:15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD}
+      TZ: Asia/Shanghai
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      # rabbitmq-diagnostics 用容器内的 erlang cookie 认证，不需要账号密码
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      # Erlang 虚拟机起得慢，2 核机上 30~60 秒很正常
+      start_period: 60s
+    mem_limit: 512m
+
+  # ============================================================
+  # 应用层
+  # ============================================================
+
+  api:
+    build:
+      # 构建上下文是 myfeed/（不是 deploy/）—— Dockerfile 里 COPY 的是
+      # go.mod / internal/ / cmd/。配套的 .dockerignore 在 myfeed/ 下，
+      # 它挡住 .run/uploads（9.4 GB）和 frontend/node_modules。
+      context: ..
+      dockerfile: deploy/Dockerfile
+    # 和 worker 用**同一个 tag**：两个进程必须是同一个镜像
+    # （见 Dockerfile 顶部：不同构会造成静默的转码失败）
+    image: myfeed-app:latest
+    restart: unless-stopped
+    logging: *default-logging
+    depends_on:
+      # condition: service_healthy 而不是默认的 service_started：
+      # 默认那个只等"容器进程起来了"，此时 mysql 还在初始化数据目录。
+      # api 连不上库是 log.Fatalf **直接退出**，于是容器反复重启 ——
+      # 现象是一堆"连接数据库失败"的日志，看起来像配置写错了。
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      TZ: Asia/Shanghai
+      # **本次上云最重要的一条**。auth/jwt.go 在这个变量为空时回落到
+      # 硬编码的 "myfeed-dev-secret-change-me"，**且不打任何警告**。
+      # 有了公网 IP 之后，任何知道这个字符串的人都能给任意账号签发 token。
+      # 它只在 api 侧读（worker 不签发也不校验 token），所以只设在这里。
+      JWT_SECRET: ${JWT_SECRET}
+    volumes:
+      # 配置文件是**挂进去的**，不在镜像里（见 Dockerfile 里
+      # "刻意不 COPY configs/" 那段）。容器内路径 /app/configs/config.yaml
+      # 必须和 cmd/main.go 里那个字面量一致，否则启动就 log.Fatalf。
+      - ../configs/config.prod.yaml:/app/configs/config.yaml:ro
+      # 上传素材 + 转码产物。**和 worker 共用同一个卷** ——
+      # api 写进去、worker 读出来（转码），worker 写完 api 再读出来（服务）。
+      # 两个进程各自挂一个卷的话，表现是"转码成功但播放 404"。
+      - uploads_data:/data/uploads
+    expose:
+      - "8080"
+    healthcheck:
+      # /healthz 是纯 liveness（router.go:77，不碰数据库）。
+      # 它通了其实说明的比看上去多：main.go 里连库失败是 log.Fatalf，
+      # 所以**这个 handler 能应答 ⇒ 启动时的 DB 连接是成功的**。
+      # 它不保证的是 Redis / RabbitMQ —— 那两个连不上只降级不退出，
+      # 唯一的判据是启动日志里有没有"缓存启用 / MQ 启用"（见验证步骤）。
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  worker:
+    # ---------- 这里**故意没有** build: ----------
+    #
+    # 镜像由上面的 api 服务构建（它同时有 build: 和 image:）。
+    # 两个服务都写 build: 的话，compose 会**并行构建两次同一个 Dockerfile**，
+    # 而两次构建都要往同一个 tag `myfeed-app:latest` 上写 —— 实测报：
+    #
+    #     failed to solve: image "docker.io/library/myfeed-app:latest": already exists
+    #
+    # 报错完全指不到"你有两个服务在构建同一个镜像"这件事上，
+    # 看起来像 Docker 的 bug 或者磁盘状态坏了。
+    #
+    # ⚠ 代价：这样写之后 **必须先 build 再 up**，顺序不能反也不能合并成
+    #   `up -d --build` 之外的写法。因为 worker 没有 build:，
+    #   compose 会认为它的镜像得从 registry 拉 —— 本地已经有就不会拉，
+    #   但本地没有（比如只跑了 up）就会去 Docker Hub 找 `myfeed-app`，
+    #   得到一句 "pull access denied"。正确顺序见 README / 部署步骤。
+    image: myfeed-app:latest
+    # 镜像的默认 CMD 是 api，worker 只改启动命令 —— 别的全都一样
+    command: ["/app/myfeed-worker"]
+    restart: unless-stopped
+    logging: *default-logging
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        # worker 少了 Redis 会**降级但不退出**：PopularityWorker 不启动，
+        # 消息积压在队列里等下次重启（worker/main.go:205 有明确处理）。
+        # 所以这里等 healthy 是为了"别让它一开始就跑在降级形态"。
+        condition: service_healthy
+      rabbitmq:
+        # 和 Redis 相反：**MQ 连不上 worker 直接退出**（worker/main.go:91
+        # 那段注释写了这个不对称）。不等 healthy 就是起来立刻死。
+        condition: service_healthy
+    environment:
+      TZ: Asia/Shanghai
+    volumes:
+      - ../configs/config.prod.yaml:/app/configs/config.yaml:ro
+      - uploads_data:/data/uploads
+    # ---------- 这里**故意没有** healthcheck ----------
+    #
+    # worker 不开 HTTP 端口，唯一能探的只有"进程还在不在"，
+    # 而那件事 restart: unless-stopped 已经在管了，加了是重复的。
+    #
+    # 更要紧的是：进程活着**不等于**转码链路好的（ffmpeg 路径写错、
+    # uploads 卷挂错、队列名字对不上，全都能让进程健康地空转）。
+    # 真正的判据是业务侧的：
+    #     SELECT transcode_status, COUNT(*) FROM videos GROUP BY 1;
+    # 有一条停在 'pending' 超过几分钟，就是 worker 那边出事了。
+    # 一个假健康的 healthcheck 比没有 healthcheck 更坏 ——
+    # 它会让人以为"worker 是好的，所以问题在别处"。
+
+  # ============================================================
+  # 入口层：**唯一对公网发布端口的服务**
+  # ============================================================
+  nginx:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.web
+    image: myfeed-web:latest
+    restart: unless-stopped
+    logging: *default-logging
+    depends_on:
+      # 其实**不需要**等：nginx.conf 里所有 proxy_pass 都用了变量形式 +
+      # resolver，nginx 启动时根本不解析 `api` 这个名字，api 没起来也照样启动
+      # （请求会得到 502，api 起来之后自动恢复，不用重启 nginx）。
+      # 写 service_started 纯粹是为了启动日志的顺序好看：先 api 后 nginx。
+      api:
+        condition: service_started
+    environment:
+      TZ: Asia/Shanghai
+    ports:
+      # 只有这一处对外。`${WEB_PORT:-80}` = 取 .env 里的 WEB_PORT，
+      # 没写就默认 80 —— 本机验证时如果 80 被占（IIS / 其它服务），
+      # 在 .env 里写 WEB_PORT=8080 即可，服务器上保持 80。
+      #
+      # ⚠ 写法是 `80:80` 而不是 `127.0.0.1:80:80`：上云就是要让公网能进。
+      #   安全组记得只放 22/80，其余全关。
+      - "${WEB_PORT:-80}:80"
+    healthcheck:
+      # busybox wget（nginx:alpine 自带）。探的是 `location /`，
+      # 也就是**只验 nginx 自己能不能把 index.html 发出来**，
+      # 不经过 api —— 这样 api 挂了不会让 nginx 被标成 unhealthy，
+      # 一层的健康问题不会被算到另一层头上。
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  # 项目名（myfeed-prod）会被自动加前缀，所以这些卷和开发那份
+  # compose 的卷不会撞车：myfeed-prod_mysql_data vs deploy_mysql_data
+  mysql_data:
+  redis_data:
+  rabbitmq_data:
+  uploads_data:

@@ -1,0 +1,54 @@
+# 构建上下文 = myfeed/ 这一整棵树，所以这个文件放在这里（和 Dockerfile 分开是没用的）。
+#
+# ---------- 为什么这个文件是必需品而不是优化 ----------
+#
+# docker build 的第一步是把**整个上下文目录**打包发给 daemon —— 它不看 .gitignore，
+# 只看这个文件。而 myfeed/ 下面躺着：
+#
+#   .run/uploads/          9.4 GB（111 条素材 + 转码产物 + 本地 ffmpeg 约 300 MB）
+#   frontend/node_modules/ ~200 MB，而且里面是**平台相关的二进制**
+#
+# 没有这个文件，本机 build 会先白等几分钟打包，服务器上 build 则可能**直接把磁盘塞爆** ——
+# 而且报错信息是 daemon 侧的 "no space left on device"，看起来像磁盘坏了，
+# 看不出是"构建上下文太大了"。
+#
+# ---------- 逐条的理由 ----------
+
+# 运行时产物。**最贵的一条**，见上。
+.run/
+
+# 依赖目录。除了体积，还有一条更硬的理由：node_modules 里的二进制是给
+# **当前平台**装的（Windows 上装的 esbuild/rollup 是 .exe），COPY 进 Linux 容器
+# 之后命令能跑起来但执行失败，报错在几百行 npm 输出之后。
+# 容器里重新 `npm ci` 是唯一正确的做法。
+frontend/node_modules/
+
+# 构建产物：由镜像里的 node 阶段重新生成，没必要从宿主机带进去
+# （也防止"我本地 build 过一次"让某次构建意外复用了旧产物）。
+frontend/dist/
+
+# 开发/压测用的探针，不参与生产镜像
+cmd/staticprobe/
+scripts/__pycache__/
+
+# 本机二进制和日志
+**/*.exe
+**/*.log
+**/*.test
+**/*.out
+
+# git 元数据：COPY . . 会把它一起带进去（几百 MB，且让层缓存每次失效）
+.git/
+.gitignore
+
+# 参考用的示例项目（.gitignore 里也排除了，这里再来一次 —— 两者机制不同，
+# 只靠 .gitignore 是拦不住 docker build 的）
+howto_feed-rebuild/
+origin-feed-project_example/
+
+# 部署密钥。**绝对不能进镜像**：镜像会被推送/导出/分享，
+# 而 config.prod.yaml 里有 MySQL 和 Redis 的密码。
+# （正常路径下它是 volume 挂进去的，不会走 COPY；这一条是防止有人
+#   把 Dockerfile 改成 `COPY . .` 之后静默把密钥烤进镜像层。）
+configs/config.prod.yaml
+deploy/.env

@@ -6,6 +6,19 @@ cmd/cmd
 .run/
 *.pid
 
+# ---------- 部署密钥：**绝对不能进仓库** ----------
+#
+# config.prod.yaml 里有 MySQL / Redis / RabbitMQ 三个密码；
+# deploy/.env 里有同样三个密码**外加 JWT_SECRET**（JWT_SECRET 是最要命的一条：
+# auth/jwt.go 在它为空时回落到硬编码的 "myfeed-dev-secret-change-me"，
+# 泄露之后任何人在公网上都能给任意账号签发 token）。
+#
+# 两个 .example 模板是**要进仓库**的（它们没有真密码），
+# 所以下面这两条必须精确到文件名，不能用 `configs/*.yaml` 那种通配 ——
+# 那会把模板一起排除掉，于是别人 clone 下来不知道要配什么。
+configs/config.prod.yaml
+deploy/.env
+
 # IDE / OS
 .idea/
 .vscode/
