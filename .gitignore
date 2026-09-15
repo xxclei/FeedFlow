@@ -30,4 +30,9 @@ __pycache__/
 Thumbs.db
 
 # 本地参考用的示例项目（不随仓库上传的重复副本）
+#
+# 这两个目录都是**别人写的**源码/文档 —— 留着本地对照用，但不该出现在本仓库的历史里。
+# 之前只有 howto_feed-rebuild/ 那条，origin-feed-project_example/ 漏了，
+# 结果上游项目的 141 个文件（含其设计文档与表结构图）被跟踪进了版本库。
 howto_feed-rebuild/feedsystem_video_go/
+origin-feed-project_example/
