@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
+	"strings"
 
 	"github.com/go-sql-driver/mysql"
 	"gorm.io/gorm"
@@ -47,7 +49,7 @@ type scoredID struct {
 func (s *LexicalSearcher) Search(ctx context.Context, q Query, depth int) (RankedList, Mode, error) {
 	// 查询词太短（CompileQuery 已经判过）→ 直接 LIKE，不碰全文索引
 	if q.UseLike {
-		list, err := s.searchLike(ctx, q.LikePattern, depth)
+		list, err := s.searchLike(ctx, q.LikePatterns, depth)
 		if err != nil {
 			return nil, "", err
 		}
@@ -81,7 +83,42 @@ func (s *LexicalSearcher) Search(ctx context.Context, q Query, depth int) (Ranke
 	if len(orList) < len(list) {
 		return list, ModeNgram, nil
 	}
-	return orList, ModeNgramOr, nil
+	if len(orList) > 0 {
+		return orList, ModeNgramOr, nil
+	}
+
+	// ---------- 第三档：LIKE 兜底 ----------
+	//
+	// 走到这里意味着 AND 和 OR **都是空集** —— 全文索引对这批 token 一条都没命中。
+	//
+	// 这时**不能直接返回空**。空集的语义是"库里没有这个视频"，而真实原因
+	// 分三种，且都不是"没有"：
+	//
+	//	① 索引按含停用词建的（"java" 的每个 bigram 都含 a，全被丢掉）
+	//	   —— 本项目踩过的那个，见 video/search_index.go 的坑 #2 / 坑 #5
+	//	② ngram_token_size 被人改过，索引里的 token 长度和查询对不上
+	//	③ 索引给已有数据的表建完没重建，内容不全
+	//
+	// 三种都是"索引不可信"，而 LIKE 全表扫**不看索引**，所以它是这一档唯一
+	// 还能给出正确答案的手段。代价是一次全表扫 —— 但这种查询本来就是要
+	// 返回空的，没有"更贵"可言；而 127 行的表上，代价可以忽略。
+	//
+	// 这正是本项目一以贯之的那条：**降级要说出来，不要悄悄返回空**。
+	// 报 ModeLikeFallback 而不是 ModeLike，就是为了让"索引可疑"这件事
+	// 在调试面板上看得见 —— 否则这个 bug 会永远藏在"搜不到就是没有"里。
+	likeList, err := s.searchLike(ctx, q.LikePatterns, depth)
+	if err != nil {
+		// 兜底自己失败不该把整路弄挂：两路召回的结构里，词法这一路返回错误
+		// 会让 service 退成纯向量（见 service.go 的 lexErr 分支）。既然
+		// 我们已经有一个（空）结果，报它比报错更贴近事实。
+		log.Printf("[search] LIKE 兜底失败，本次返回空集: %v", err)
+		return orList, ModeNgramOr, nil
+	}
+	if len(likeList) > 0 {
+		log.Printf("[search] 全文索引零命中，LIKE 兜底救回 %d 条 —— "+
+			"索引可疑，查 SHOW CREATE TABLE videos 的 FULLTEXT COMMENT 与 @@ngram_token_size", len(likeList))
+	}
+	return likeList, ModeLikeFallback, nil
 }
 
 // searchMatch 走全文索引的查询：相关度倒序 + (create_time, id) 兜底。
@@ -133,33 +170,53 @@ func (s *LexicalSearcher) searchMatch(ctx context.Context, boolean string, depth
 	return list, nil
 }
 
-// searchLike 降级那一路：LIKE '%q%'，时间倒序。
+// searchLike 降级那一路：LIKE，时间倒序。
 //
-// 它的存在有两个理由，而且是**互相独立**的两个：
+// 它的存在有三个理由，而且是**互相独立**的三个：
 //
 //	① 查询词短于 ngram_token_size（单字、`C++`）—— 全文索引里没有对应的 token，
 //	   走 MATCH 一定返回空集且不报错。单字搜索是中文用户的自然输入，必须有路可走。
 //	② 全文索引没建成功（没权限 / MyISAM / 被人删了）—— ErrNoFullTextIndex。
+//	③ **全文索引在、但零命中** —— 索引内容不可信（停用词削掉了 bigram、
+//	   ngram_token_size 被改过、建完没重建）。见 Search 里的第三档。
 //
 // 单独用 ① 一个理由就足够让它存在了 —— 这也是为什么它必须写在这里，
-// 而不能指望"将来上 Elasticsearch 了就不需要了"。
+// 而不能指望"将来上 Elasticsearch 了就不需要了"。②③ 是它顺带接住的。
+//
+// ---------- 为什么是多个模式 ----------
+//
+// patterns 里的每个模式都要满足（AND 连起来），语义和 MatchAnd 对齐。
+// 只有一个模式时退化成原来的形状，行为不变。
+//
+// ESCAPE 的字符从常量拼进来，不写字面量 '!' —— 两处必须一致，
+// 而这种"两处常量手工同步"正是最容易在改动时漏掉的地方。
 //
 // Score 恒为 0：LIKE 没有相关度这个概念，顺序纯粹是时间倒序。
 // 调用方**不要**把这个 0 当成"相关度是 0"往外报（那会让人以为全都不相关）。
-func (s *LexicalSearcher) searchLike(ctx context.Context, pattern string, depth int) (RankedList, error) {
+func (s *LexicalSearcher) searchLike(ctx context.Context, patterns []string, depth int) (RankedList, error) {
 	type idRow struct {
 		ID uint `gorm:"column:id"`
 	}
 	var rows []idRow
 
-	// ESCAPE 的字符从常量拼进来，不写字面量 '!' —— 两处必须一致，
-	// 而这种"两处常量手工同步"正是最容易在改动时漏掉的地方
-	where := fmt.Sprintf("(title LIKE ? ESCAPE '%s' OR description LIKE ? ESCAPE '%s')",
-		likeEscapeChar, likeEscapeChar)
+	if len(patterns) == 0 {
+		// 没有模式就**不要发一条 WHERE (1=1) 的全表扫**。理论上调用方不会
+		// 传空（CompileQuery 保证至少有一个），但"理论上不会"不是不发问的理由：
+		// 空切片会让下面 strings.Join 出空串，拼出 `WHERE ` 结尾的非法 SQL。
+		return RankedList{}, nil
+	}
+
+	clauses := make([]string, 0, len(patterns))
+	args := make([]any, 0, len(patterns)*2)
+	for _, p := range patterns {
+		clauses = append(clauses, fmt.Sprintf("(title LIKE ? ESCAPE '%s' OR description LIKE ? ESCAPE '%s')",
+			likeEscapeChar, likeEscapeChar))
+		args = append(args, p, p)
+	}
 
 	err := s.db.WithContext(ctx).Model(&video.Video{}).
 		Select("id").
-		Where(where, pattern, pattern).
+		Where(strings.Join(clauses, " AND "), args...).
 		Order("create_time DESC, id DESC").
 		Limit(depth).
 		Scan(&rows).Error

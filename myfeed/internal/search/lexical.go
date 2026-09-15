@@ -63,10 +63,18 @@ type Query struct {
 
 	// UseLike 为真表示"不要碰全文索引，走 LIKE"（查询词太短，见 minMatchRunes）
 	UseLike bool
-	// LikePattern 已经转义好的 LIKE 模式，形如 `%三%`。
+	// LikePatterns 走 LIKE 时要**同时满足**（AND）的模式集合，每个都已经转义好
+	// 并带上了两侧的 `%`，形如 `%三%`。
+	//
 	// 转义在这里做而不是在 repo 里：**转义是"查询语法"的一部分**，
 	// 和 MatchAnd 的拼装是同一层的事，散到 SQL 那边就会有人漏调。
-	LikePattern string
+	//
+	// 是一个切片而不是单个模式，因为 LIKE 有**两个**触发点，
+	// 而它们要的东西形状不同（理由见下面 CompileQuery 里赋值处）：
+	//
+	//	UseLike（查询词太短）  → 整个原始输入算一个模式
+	//	全文索引零命中的兜底   → 每个 token 一个模式
+	LikePatterns []string
 }
 
 // CompileQuery 把用户输入编译成可执行的查询。
@@ -83,6 +91,12 @@ type Query struct {
 //	"三"           → UseLike（1 个字，ngram 索引里没有长度 1 的 token）
 //	"C++"          → UseLike（抽出的 token 只有 "C"，也不够 2 个字）
 //	"+++ ???"      → UnsearchableError（一个字母数字都没有）
+//
+// ⚠ 但"token 够长"**不等于**"全文索引一定认得它"。有一条会漏：
+// ngram 把含停用词的 bigram 整条丢掉，而默认停用词表里有单字母 a 和 i，
+// 于是 "java"（ja/av/va 全含 a）在索引里一个 bigram 都不剩 —— 词再长也搜不到。
+// **那种失败在编译期看不出来**（要查索引内容才知道），所以由 lexical_repo.go 的
+// 第三档 LIKE 兜底接住。这里只负责把 LikePatterns 备好，不假装能预判。
 func CompileQuery(raw string) (Query, error) {
 	q := Query{Raw: strings.TrimSpace(raw)}
 
@@ -115,7 +129,11 @@ func CompileQuery(raw string) (Query, error) {
 		// 代价只是这一路走全表扫描（127 行的表，无所谓；真到了百万行，
 		// 该做的是换个 ngram_token_size 或者上真正的搜索引擎，而不是拒绝单字查询）。
 		q.UseLike = true
-		q.LikePattern = "%" + escapeLike(q.Raw) + "%"
+		// **整个原始输入算一个模式**，不是按 token 拆。
+		// 这时用户的输入本来就是一个词（"三"、"C++"），拆开只会把 "C++"
+		// 变成 "%C%"，语义从"包含 C++ 这个串"漂成"包含字母 C" —— 结果集大 100 倍
+		// 而且都不是他要的。
+		q.LikePatterns = []string{likePattern(q.Raw)}
 		return q, nil
 	}
 
@@ -135,8 +153,25 @@ func CompileQuery(raw string) (Query, error) {
 	// OR 形式：同一批 token 去掉 `+`。AND 命中不够时 service 会拿它重试一次。
 	// 这就是"搜索引擎"和"严格 AND"的区别：全都要 vs 有就行。
 	q.MatchOr = strings.Join(usable, " ")
+
+	// **每个 token 一个模式**（和上面 UseLike 那条相反，理由也在那边）。
+	// 这条只在"全文索引连一条都没命中"时才会被用到（见 lexical_repo.go 的第三档）。
+	//
+	// 为什么按 token 而不是按整串：走到那一档时用户输的是一个短语（"java 教程"），
+	// 而整串 LIKE 要求标题/描述里有"java 教程"这个**连着的**子串 ——
+	// 库里那条叫 "java-...教程" 的会因此漏掉。按 token AND 才是"用户要的意思"
+	// 最直接的翻译，也是 MatchAnd 语义的逐字对应。
+	q.LikePatterns = make([]string, 0, len(usable))
+	for _, t := range usable {
+		q.LikePatterns = append(q.LikePatterns, likePattern(t))
+	}
 	return q, nil
 }
+
+// likePattern 把一个**可能含 LIKE 元字符**的串包成"包含它"的模式。
+//
+// 包 `%` 和转义都在这里做，调用方不用记两件事 —— 上面两处赋值都不自己拼 `%`。
+func likePattern(s string) string { return "%" + escapeLike(s) + "%" }
 
 // likeEscaper 转义 LIKE 的元字符。
 //

@@ -1,6 +1,7 @@
 package apierror
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 
@@ -37,7 +38,38 @@ func ClassifyHTTPStatus(err error) int {
 		return http.StatusBadRequest
 	case errors.Is(err, gorm.ErrRecordNotFound):
 		return http.StatusNotFound
+	// ---------- JSON 请求体坏了 → 400，不是 500 ----------
+	//
+	// 这两类错误只可能来自 c.ShouldBindJSON，含义是**客户端发的东西不是合法 JSON**：
+	//
+	//	*json.SyntaxError       —— 语法就不对（`{not json`）
+	//	*json.UnmarshalTypeError —— 语法对但类型对不上（`"video_id": "abc"`）
+	//
+	// 不特判的话它们会掉进 default → 500，而那是在说"服务端崩了"，
+	// 与事实相反 —— 服务端好好的，是请求本身不合法。后果有三层：
+	//
+	//  1. 任何监控/告警会把它算成服务端故障，掩盖真正的问题；
+	//  2. 排查的人会往服务端日志里找，而那里什么都没有；
+	//  3. **对本项目最要命的一条**：手工 curl 调试时字段名写错（比如把
+	//     video_id 写成 videoid，或者少一个引号），返回的是 500 ——
+	//     看起来完全像是后端坏了，于是整条链路被重新怀疑一遍。
+	//     （这条已经踩过：看 gin-ignores-unknown-json-fields 那条记录。）
+	//
+	// ⚠ 顺序要求：这两个 case 必须排在 default **之前**，而 errors.As 要求
+	// 目标是指针的指针 —— 写成 json.SyntaxError 会 panic。
+	case asJSONSyntaxError(err) || asJSONTypeError(err):
+		return http.StatusBadRequest
 	default:
 		return http.StatusInternalServerError
 	}
+}
+
+func asJSONSyntaxError(err error) bool {
+	var e *json.SyntaxError
+	return errors.As(err, &e)
+}
+
+func asJSONTypeError(err error) bool {
+	var e *json.UnmarshalTypeError
+	return errors.As(err, &e)
 }

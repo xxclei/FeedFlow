@@ -223,6 +223,40 @@ func (vr *VideoRepository) MarkEmbedded(ctx context.Context, id uint, model stri
 		Updates(map[string]any{"embedding_model": model, "embedded_at": now}).Error
 }
 
+// MarkTranscode 一次性写转码状态的三个字段。
+//
+// ---------- 为什么是"三个字段一起写"而不是三个方法 ----------
+//
+// 状态机每一次迁移要写的东西**恰好是同一组**：
+//
+//	running  status=running, hls_url="",  hls_dir=<这次的产物目录>
+//	ready    status=ready,   hls_url=<稳定 URL>, hls_dir=<产物根目录>
+//	failed   status=failed,  hls_url="",  hls_dir=""
+//
+// 拆成 `MarkRunning` / `MarkReady` / `MarkFailed` 三个方法的话，
+// "running 时要不要清 hls_url" 这个问题就要回答三次，
+// 而三次里只要有一次答错，表现是**前端拿着一个已经不存在的 hls_url 去播放**
+// （产物目录刚被清掉）—— 播放器一片黑，接口 200，日志干净。
+//
+// 合成一个方法之后，这三个字段的取值在调用处是**一眼可读的一整行**，
+// 没有中间状态可能被漏写。
+//
+// ---------- running 为什么必须清空 hls_url ----------
+//
+// 因为重转时新产物写在新目录里，**旧的 hls_url 在产出的那一刻就已经
+// 不再指向可播的东西**（master 会被重写）。清空它 = 让前端立刻落回直传
+// 原文件那条路。宁可让用户看一段 12 Mbps 的原片（能播，只是慢），
+// 也不要让他拿到一个指向半截产物的地址（不能播）。
+func (vr *VideoRepository) MarkTranscode(ctx context.Context, id uint, status, hlsURL, hlsDir string) error {
+	return vr.db.WithContext(ctx).Model(&Video{}).
+		Where("id = ?", id).
+		Updates(map[string]any{
+			"transcode_status": status,
+			"hls_url":          hlsURL,
+			"hls_dir":          hlsDir,
+		}).Error
+}
+
 func (vr *VideoRepository) ListByAuthorID(ctx context.Context, authorID int64) ([]Video, error) {
 	var videos []Video
 	if err := vr.db.WithContext(ctx).

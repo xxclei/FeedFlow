@@ -3,8 +3,12 @@ package social
 import (
 	"context"
 	"errors"
+	"log"
+	"time"
 
 	"myfeed/internal/account"
+	"myfeed/internal/middleware/rabbitmq"
+	rediscache "myfeed/internal/middleware/redis"
 )
 
 // SocialService 关注业务。
@@ -31,16 +35,66 @@ type SocialService struct {
 	repo        *SocialRepository
 	accountrepo *account.AccountRepository
 
-	// 阶段7回填：cache *rediscache.Client
-	// 阶段9回填：socialMQ *rabbitmq.SocialMQ
+	// cache 阶段7接进来的：关注/取关后失效**关注流**的响应缓存。
 	//
-	// 本阶段两个都没有 —— 不是"传 nil"，是类型还不存在，字段写不出来。
-	// 和阶段4 的 NewLikeService 同一个处理（见那里的说明）：
-	// 包建好了再把字段和参数补上，构造函数签名改一次。
+	// 注意 social 自己**不缓存任何东西** —— 它只用 cache 去删别人的 key。
+	// 这看着别扭，但依赖方向是对的：缓存的是 feed 的响应，失效逻辑天然属于
+	// "谁改了数据谁负责通知"。另一种做法是让 feed 去轮询 social 的变化，那是倒过来。
+	// 可以为 nil（启动降级），nil 时失效变成空操作。
+	cache *rediscache.Client
+
+	// socialMQ 阶段9 接进来的。**范式 B 的关键差别就在这里**：
+	// 它不是写路径，只是"写完之后再喊一嗓子"。可以认为它是一段
+	// 工业化的 log.Printf —— 发失败只记日志，绝不影响这次关注的结果。
+	//
+	// 可以为 nil（RabbitMQ 启动连不上），nil 时整个 MQ 副作用静默跳过。
+	socialMQ *rabbitmq.SocialMQ
 }
 
-func NewSocialService(repo *SocialRepository, accountrepo *account.AccountRepository) *SocialService {
-	return &SocialService{repo: repo, accountrepo: accountrepo}
+func NewSocialService(repo *SocialRepository, accountrepo *account.AccountRepository, cache *rediscache.Client, socialMQ *rabbitmq.SocialMQ) *SocialService {
+	return &SocialService{repo: repo, accountrepo: accountrepo, cache: cache, socialMQ: socialMQ}
+}
+
+// invalidateFollowingFeedCache 删掉某个用户的**全部**关注流页缓存。
+//
+// ---------- 为什么是 DelByPattern 而不是 Del 一个 key ----------
+//
+// 关注流的缓存 key 里有三样东西：limit、accountID、before（游标）。
+// 而 before 取遍了所有翻过的页，是**不可枚举**的 —— 你没法知道用户翻过哪几页。
+// 所以只能按模式删：`feed:listByFollowing:*:accountID=<id>:*`
+// （limit 和 before 都用 * 吃掉）。
+//
+// 这就是"缓存 key 设计决定失效策略"的实例：如果 key 里没有 before
+// （比如把整条流当成一个 key 缓存），失效就简单了，但翻页会全错。
+// 反过来，key 越精确，失效越只能靠模式匹配 —— 而 SCAN 是 O(keyspace) 的。
+// 原项目也接受这个代价，因为关注/取关是**低频写**（人一天关注不了几个）。
+// 如果这是点赞那种热点写，正确做法是维护一个 `user:<id>:following_pages` 的
+// Set 索引，靠集合精确删 —— 用空间换掉 SCAN。
+//
+// ---------- 为什么忽略错误、用 Background ----------
+//
+// DB 已经写成功了。删缓存失败只会让用户最多 24 小时（followingCacheTTL）
+// 看不到新关注的人的动态，而返回错误会让用户看到"关注失败"却其实关注成功了 ——
+// 后者更糟。和 video 的 invalidateDetails 是同一条纪律：
+// **写路径的缓存失效是尽力而为的，TTL 才是最终保底。**
+//
+// 超时给 200ms（比一般的 50ms 宽）：SCAN 要遍历 keyspace，
+// 比单条 DEL/GET 慢，用 50ms 容易在高 key 数量下稳定失败。
+// 注意这里不接请求的 ctx —— 客户端断开不该让失效半途而废。
+func (s *SocialService) invalidateFollowingFeedCache(followerID uint) {
+	if s.cache == nil {
+		return
+	}
+	// Key() 会把 v1: 前缀加上；DelByPattern **不会**自动加前缀（它直接透传给 SCAN），
+	// 所以模式必须自己用 Key() 拼 —— 否则模式匹配不到任何东西，
+	// 而且不会有任何报错，失效会静默失效。这是最容易埋雷的一行
+	pattern := s.cache.Key("feed:listByFollowing:*:accountID=%d:*", followerID)
+
+	opCtx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	if err := s.cache.DelByPattern(opCtx, pattern); err != nil {
+		log.Printf("[social] 失效关注流缓存失败 follower=%d: %v", followerID, err)
+	}
 }
 
 // Follow 关注。四层校验，每一层挡一种非法输入，**顺序不能乱**：
@@ -63,7 +117,8 @@ func NewSocialService(repo *SocialRepository, accountrepo *account.AccountReposi
 // 顺带省一次 COUNT：关注自己的请求在 ② 就被挡下，不走 ③。
 //
 // （文档说"自关注会先被 already followed 误拦"只在**已经存在自关注脏数据**时成立，
-//  描述的是症状不是机理。真正的理由是上面那句"会插入成功"。）
+//
+//	描述的是症状不是机理。真正的理由是上面那句"会插入成功"。）
 func (s *SocialService) Follow(ctx context.Context, social *Social) error {
 	// ① 两端存在性。follower 来自 JWT，正常必然存在；vlogger 是客户端传的，必须查。
 	//    两次 FindByID 不合并成一次 IN 查询：错误消息要能分清是哪一端不存在
@@ -94,23 +149,43 @@ func (s *SocialService) Follow(ctx context.Context, social *Social) error {
 		return err
 	}
 
-	// 阶段7插这里：s.invalidateFollowingFeedCache(ctx, social.FollowerID)
-	//
-	// 届时做的事：按 pattern `feed:listByFollowing:*:accountID=<followerID>:*` 删掉
-	// 这个用户的**所有游标页**缓存（SCAN + DEL，不是只删第一页 —— 只删第一页的话，
-	// 翻到第二页还是会看到关注前的结果）。
-	//
-	// 为什么在这里还写不出占位方法：`*rediscache.Client` 这个类型还不存在，
-	// 写 `if s.cache == nil { return }` 都编译不过（字段本身定义不出来）。
-	// 一个"被调用但什么都不做"的空方法比一行注释更糟 —— 它会让人以为功能已就位。
+	// 阶段7：DB 写成功后再失效缓存 —— 顺序不能反。
+	// 先删缓存再写库的话，中间那个窗口里别人的读请求会把**旧数据**重新填回缓存，
+	// 于是这次失效等于没做（经典 cache-aside 竞态）。
+	// 先写库再删缓存，最坏也只是"极短时间内的读拿到旧值"，不会永久脏。
+	s.invalidateFollowingFeedCache(social.FollowerID)
 
-	// 阶段9插这里：发 socialMQ.Follow(followerID, vloggerID)，失败仅 log.Printf
+	// 阶段9：MQ 冗余双写（范式 B）。**失败只记日志**，理由见类型注释。
 	//
-	// 注意范式 B 的代价：MQ 消息和这次 DB 写入是**两条独立的写**，
-	// Worker 消费时会再 Insert 一次同一条关系 → 撞唯一索引 1062 → Worker 忽略它。
+	// 范式 B 的代价如实记下：MQ 消息和上面那次 DB 写入是**两条独立的写**，
+	// SocialWorker 消费时会再 Insert 一次同一条关系 → 撞唯一索引 1062 → 忽略它。
 	// 也就是说 MQ 那一路是"冗余的"，它存在只是为了触发通知（"关注了你"）。
-
+	//
+	// 换个角度看，这个冗余是有用的：它让"关注成功但通知链路挂了"和
+	// "关注都没成功"变成两件独立的事。前者用户可以接受，后者不行 ——
+	// 而范式 A 里这两件事是绑在一起的（消息发不出去就走降级，一荣俱荣）。
+	s.publishSocialMQ(ctx, "Follow", social, s.socialMQ.Follow(ctx, social.FollowerID, social.VloggerID))
 	return nil
+}
+
+// publishSocialMQ 统一处理"投递结果"：**失败只记日志，绝不向上返回**。
+//
+// 为什么把 err 当参数传进来、而不是在这里判断收发哪一路：
+// 收发本身一行就够，但"失败只记日志"这条纪律必须**只写一遍**。
+// 写成 if s.socialMQ != nil { ... } 的话，两处调用点各有一套判断，
+// 以后有人在其中一处顺手加个 `return err`，范式 B 就悄悄变成了
+// "关注会因通知投递失败而失败"——而那正是本模块开头明确否掉的语义。
+//
+// 另外注意 s.socialMQ 为 nil 时这一行也是安全的：SocialMQ 的方法
+// 都是**指针接收者且自查 nil**（见 socialMQ.go 的 publish），
+// 所以 `(*SocialMQ)(nil).Follow(...)` 返回的是一个 error 而不是 panic。
+// 这正是那种"守卫写在被调方比写在调用方更可靠"的例子 ——
+// 调用方忘了判空，代价只是一条日志，不是一个 panic。
+func (s *SocialService) publishSocialMQ(ctx context.Context, action string, social *Social, err error) {
+	if err != nil {
+		log.Printf("[social] %s 投递失败（关注关系已落库, 仅通知丢失）follower=%d vlogger=%d: %v",
+			action, social.FollowerID, social.VloggerID, err)
+	}
 }
 
 // Unfollow 取关。
@@ -149,9 +224,17 @@ func (s *SocialService) Unfollow(ctx context.Context, social *Social) error {
 		return err
 	}
 
-	// 阶段7插这里：s.invalidateFollowingFeedCache(ctx, social.FollowerID)
-	// 阶段9插这里：发 socialMQ.UnFollow(...)，失败仅 log.Printf
+	// 阶段7：同上，DB 写成功后失效
+	s.invalidateFollowingFeedCache(social.FollowerID)
 
+	// 阶段9：同上，冗余双写，失败只记日志。
+	//
+	// 取关也要发消息，原因值得说一句：**通知链路只绑正向动作**
+	// （`social.follow` → notification.social；取关了还给人发通知是骚扰），
+	// 但 `social.events` 队列绑的是 `social.*`，所以取关**会**进 SocialWorker ——
+	// 它要负责删掉那条 social 记录（冗余双写的另一半）。
+	// 同一条消息，两条队列看到的是不同的子集，靠绑定 key 在交换机层分流。
+	s.publishSocialMQ(ctx, "Unfollow", social, s.socialMQ.Unfollow(ctx, social.FollowerID, social.VloggerID))
 	return nil
 }
 

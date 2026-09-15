@@ -77,8 +77,26 @@ func (s *ChunkUploadSession) chunkLen(index int) int64 {
 }
 
 // UploadedChunks 已传分片的下标列表（断点续传时告诉前端"只补这些之外的"）
+//
+// ⚠ 返回的**永远**是 []int 而不是 nil —— 哪怕一片都没传。
+//
+// 这不是风格问题：nil slice 会被 encoding/json 编成 `null`（不是 `[]`），
+// 而前端拿到 null 就是 `init.uploaded_chunks.reduce(...)` 直接崩。
+// 2026-09-15 上云当天就是这么炸的：
+//
+//	TypeError: Cannot read properties of null (reading 'reduce')
+//
+// 触发路径很窄但很真实：**会话建好了、却一片都没落到盘上**（第一次传就断了），
+// 然后重试。重试时 InitChunkUpload 会命中断点续传分支（file_hash 相同、
+// 分片几何一致），走的就是这个函数 —— 此时 UploadedBits 全是 false，
+// 下面那个 append **一次都没执行**，于是 `var indices []int` 原样返回 nil。
+//
+// 注意同一个 handler 里"新建会话"那条路（chunk_handler.go:200）特意写了
+// `[]int{}`，说明这个坑当初是**知道**的 —— 只是没落在函数内部。
+// "知道这件事"和"每一个返回点都做对"是两件事；写进函数里，两个调用点
+// （chunk_handler.go:151 / :360）就同时对了。
 func (s *ChunkUploadSession) UploadedChunks() []int {
-	var indices []int
+	indices := make([]int, 0, len(s.UploadedBits))
 	for i, uploaded := range s.UploadedBits {
 		if uploaded {
 			indices = append(indices, i)

@@ -2,12 +2,15 @@ package video
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log"
 	"strings"
 	"time"
 
 	"myfeed/internal/apierror"
+	"myfeed/internal/config"
+	rediscache "myfeed/internal/middleware/redis"
 
 	"gorm.io/gorm"
 )
@@ -36,16 +39,58 @@ type VectorIndexer interface {
 	IndexVideo(ctx context.Context, id uint, text string) error
 }
 
+// 阶段7 详情缓存的四个参数。全是"猜一个数"的参数，所以每个都写清楚为什么。
+const (
+	// detailCacheTTL 详情缓存的存活时间。
+	// 短的收益：视频被改（点赞数/热度）后最多脏 5 分钟。
+	// 长的收益：DB 压力更小。5 分钟是这个项目里"读多写少、允许短暂陈旧"的折中。
+	detailCacheTTL = 5 * time.Minute
+
+	// detailCacheOpTimeout 单次 Redis 操作的超时。
+	// 缓存是加速件 —— 给它设上限，Redis 抖动时宁可快速失败回源，
+	// 也不能让一个本来 15ms 的读请求卡在 Redis 上变成 2 秒。
+	detailCacheOpTimeout = 50 * time.Millisecond
+
+	// detailLockTTL 防击穿锁的 TTL。
+	// 按"一次 DB 回源 + 一次写缓存"的最坏耗时估的：太短→回源没做完锁就易主，
+	// 防击穿失效；太长→持锁的 goroutine 挂了，其他请求白等。
+	detailLockTTL = 2 * time.Second
+
+	// detailLockWaitStep / detailLockWaitRounds 没抢到锁时的轮询节奏：
+	// 5 × 20ms = 最多等 100ms。等不到就自己兜底查 DB —— 防击穿是"削峰"，
+	// 不是"必须所有人都等着"，可用性优先于完美防护。
+	detailLockWaitStep   = 20 * time.Millisecond
+	detailLockWaitRounds = 5
+)
+
 // VideoService 视频业务：发布事务、详情查询、计数变更。
-// cache 阶段7回填（GetDetail 防击穿缓存）、popularityMQ 阶段9回填（热度事件）
+// cache 阶段7新增（GetDetail 防击穿缓存）、popularityMQ 阶段9回填（热度事件）
 type VideoService struct {
 	repo *VideoRepository
 	// vectorIdx 本轮新增：发布后异步补向量。可以为 nil
 	vectorIdx VectorIndexer
+	// cache 阶段7新增：详情缓存 + 防击穿锁。**可以为 nil**（启动降级）——
+	// 所有用到它的地方都先 `if vs.cache == nil` 走纯 DB 路径，
+	// 封装层也做了 nil 接收器保护，双保险
+	cache *rediscache.Client
+	// cacheTTL 做成字段而不是直接用常量：测试里想验"过期后回源"就得能调小它
+	cacheTTL time.Duration
+	// storage 本轮新增：上传根目录。Publish 要按 PlayURL 反查出磁盘路径
+	// 才能去探测源文件（见 probeSource）。
+	//
+	// 传值而不是指针：它只有一个字符串字段，拷贝成本为零，
+	// 而且值语义意味着**发布过程中它不可能被别处改掉**。
+	storage config.StorageConfig
 }
 
-func NewVideoService(repo *VideoRepository, vectorIdx VectorIndexer) *VideoService {
-	return &VideoService{repo: repo, vectorIdx: vectorIdx}
+func NewVideoService(repo *VideoRepository, vectorIdx VectorIndexer, cache *rediscache.Client, storage config.StorageConfig) *VideoService {
+	return &VideoService{
+		repo:      repo,
+		vectorIdx: vectorIdx,
+		cache:     cache,
+		cacheTTL:  detailCacheTTL,
+		storage:   storage,
+	}
 }
 
 // Publish 发布：校验 → 一个事务里做三件事：
@@ -84,6 +129,42 @@ func (vs *VideoService) Publish(ctx context.Context, video *Video, tagNames []st
 		return errors.New("cover url is required")
 	}
 
+	// ---------- 上传质量门禁：探测源文件，决定直传还是转码 ----------
+	//
+	// **必须在事务之前**，有两个理由：
+	//
+	//  1. 它是本地文件头读取（约 1ms），但**事务里不该有 IO**。
+	//     事务持有行锁的时间越短越好，把一个文件读放进事务里，
+	//     一旦遇到慢盘（网络盘、杀软实时扫描）就会把锁的时间放大几个量级。
+	//  2. 探测的结果要写进**下面那条 INSERT**（①），所以它必须先算出来。
+	//
+	// 探测用的是 PlayURL 反查出来的磁盘路径，而 PlayURL 是**客户端传的** ——
+	// 所以这里既可能拿不到路径（穿越/格式不对），也可能文件根本不在
+	// （客户端先发布、文件后到，或者文件被手工删了）。两种都算 probe 失败。
+	probe := vs.probeSource(video.PlayURL)
+	video.ProbeStatus = probe.status
+	if probe.info != nil {
+		video.SrcWidth = probe.info.Width
+		video.SrcHeight = probe.info.Height
+		video.SrcBitrateKbps = probe.info.BitrateKbps
+		video.SrcDurationMS = probe.info.DurationMS
+	}
+
+	decision := decideTranscode(probe.info, probe.status == ProbeStatusOK)
+	// "skipped" 和 "" 是两件事："" 是存量数据（从没经过门禁），
+	// "skipped" 是"门禁看过了，判定为直传"。前端两者都走直传路径，
+	// 但运营看板上必须能区分 —— 否则"有多少条真的过了门禁"永远说不清。
+	//
+	// 注意 "failed" 是**转码失败**（worker 写），不是探测失败。
+	// 探测失败在这里也是 "skipped"：结果是直传，和探明后判定直传一样。
+	video.TranscodeStatus = TranscodeSkipped
+	if decision.Transcode {
+		video.TranscodeStatus = TranscodePending
+	}
+	log.Printf("[Publish] 门禁 video=%s 探测=%s 源=%dx%d@%dkbps %vms → %s（%s）",
+		video.PlayURL, video.ProbeStatus, video.SrcWidth, video.SrcHeight,
+		video.SrcBitrateKbps, video.SrcDurationMS, video.TranscodeStatus, decision.Reason)
+
 	// 事务保证视频写库和事件信写入的一致性
 	err := vs.repo.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		// ① 视频本体
@@ -94,12 +175,33 @@ func (vs *VideoService) Publish(ctx context.Context, video *Video, tagNames []st
 		// ② 事件信（publish 产生的"广播"先存根，阶段9才寄出）
 		msg := OutboxMsg{
 			VideoID:    video.ID,
-			EventType:  "video_published",
+			EventType:  EventTypeVideoPublished,
 			Status:     "pending",
 			CreateTime: video.CreateTime,
 		}
 		if err := tx.Create(&msg).Error; err != nil {
 			return err
+		}
+
+		// ②' 转码任务信 —— **和上面那条在同一个事务里**。
+		//
+		// 这就是 outbox 模式的价值所在：如果转码消息在事务提交之后单独发，
+		// 那么"提交成功但发消息失败"会留下一条**永远不会被转码**的视频，
+		// 而它在库里看起来完全正常（transcode_status 停在 pending 而已）。
+		// 放进同一个事务，"视频存在 ⇔ 转码任务已记录"由数据库保证。
+		//
+		// 注意 EventType 现在是**有读者的**（pollOnce 按它分流）——
+		// 在这之前它是个死字段，加第二种事件会静默投错队列。
+		if decision.Transcode {
+			tmsg := OutboxMsg{
+				VideoID:    video.ID,
+				EventType:  EventTypeVideoTranscode,
+				Status:     "pending",
+				CreateTime: video.CreateTime,
+			}
+			if err := tx.Create(&tmsg).Error; err != nil {
+				return err
+			}
 		}
 
 		// ③ 标签：两个来源取并集，再挂上去。
@@ -195,7 +297,8 @@ func (vs *VideoService) Delete(ctx context.Context, id uint, authorID uint) erro
 		return apierror.ErrForbidden
 	}
 	_, err = vs.repo.DeleteOwnedVideos(ctx, []uint{id}, authorID)
-	// 阶段7回填：失效详情缓存 vs.cache.Del("video:detail:id=%d")
+	// 阶段7：删库成功才失效缓存
+	vs.invalidateDetails([]uint{id})
 	return err
 }
 
@@ -230,7 +333,9 @@ func (vs *VideoService) DeleteBatch(ctx context.Context, ids []uint, authorID ui
 		}
 	}
 
-	// 阶段7回填：逐条失效详情缓存（批量删除这里要考虑 pipeline，不是 N 次 Del）
+	// 阶段7：只失效**真正删掉**的那些（owned），skipped 的视频还在，缓存要留着。
+	// 走 pipeline 而不是 N 次 Del —— 批量接口的 N 本来就是大数
+	vs.invalidateDetails(owned)
 	return DeleteBatchResponse{
 		Deleted:    len(owned),
 		DeletedIDs: owned,
@@ -238,25 +343,210 @@ func (vs *VideoService) DeleteBatch(ctx context.Context, ids []uint, authorID ui
 	}, nil
 }
 
+// invalidateDetails 失效若干条视频的详情缓存。
+//
+// 三个刻意的选择：
+//
+//	① 用 context.Background() 而不是请求 ctx：删除**已经落库了**，
+//	   不能因为客户端断开就留下一个脏缓存。写操作后的失效必须跑完。
+//	② 忽略错误：缓存删不掉的最坏后果是"旧详情多活 5 分钟"（TTL 兜底），
+//	   而返回错误会让用户看到"删除失败"却其实已经删了 —— 更糟。
+//	   这也正是给缓存设 TTL 的意义：失效是尽力而为的，TTL 才是最终保底。
+//	③ pipeline：N 条 DEL 压成一次往返。N=100 时省下 99 次 RTT。
+func (vs *VideoService) invalidateDetails(ids []uint) {
+	if vs.cache == nil || len(ids) == 0 {
+		return
+	}
+	keys := make([]string, 0, len(ids))
+	for _, id := range ids {
+		keys = append(keys, vs.cache.Key("video:detail:id=%d", id))
+	}
+	opCtx, cancel := context.WithTimeout(context.Background(), detailCacheOpTimeout)
+	defer cancel()
+	_ = vs.cache.DelMany(opCtx, keys)
+}
+
 // ListByAuthorID 某作者的视频列表（时间倒序，200 条封顶）
 func (vs *VideoService) ListByAuthorID(ctx context.Context, authorID uint) ([]Video, error) {
 	return vs.repo.ListByAuthorID(ctx, int64(authorID))
 }
 
-// GetDetail 详情。
-// 阶段7回填：先查 Redis（50ms 超时），未命中时加防击穿锁（Lock→DoubleCheck→回填），
-// 拿不到锁的请求短暂等待读缓存，最终都回落本方法直查 DB
+// GetDetail 详情（阶段7：缓存旁路 + 防击穿锁）。
+//
+// 完整链路：
+//
+//	读缓存(50ms) ─命中─► 返回
+//	   │ miss
+//	   ▼
+//	二次裸读 → 区分「真未命中」和「Redis 故障」
+//	   │ 真 miss                            │ 故障
+//	   ▼                                    ▼
+//	SETNX lock:<cacheKey> 随机token, 2s     直接回源（抢锁也是白抢）
+//	   │ 拿到锁            │ 没拿到锁
+//	   ▼                   ▼
+//	双重检查缓存          轮询 5×20ms 读缓存 ─读到─► 返回
+//	   │ 仍 miss                            │ 还没读到
+//	   ▼                                    ▼
+//	查 DB → 回填 → Unlock   兜底自己查 DB（不再等）
+//
+// ---------- 为什么"二次裸读"这一步不能省 ----------
+//
+// 下面的 getCached 闭包把**所有** error 都当成"没命中"（缓存故障不该让读请求失败）。
+// 但抢锁之前必须知道到底是"key 不在"还是"Redis 挂了"：Redis 挂了的时候 SETNX 一样
+// 会失败，白跑一趟还多 50ms 延迟。所以需要一次**能看见错误码**的裸读来做裁决。
+//
+// 这也是原项目那段的写法，但它多调了一次 getCached 造成冗余读；这里合并掉了。
 func (vs *VideoService) GetDetail(ctx context.Context, id uint) (*Video, error) {
-	return vs.repo.GetByID(ctx, id)
+	// 启动降级：Redis 没连上，整个缓存层跳过，功能一条不少
+	if vs.cache == nil {
+		return vs.repo.GetByID(ctx, id)
+	}
+
+	cacheKey := vs.cache.Key("video:detail:id=%d", id)
+
+	// getCached：读缓存。任何失败（未命中 / 超时 / 反序列化错）都返回 err，
+	// 由调用方决定是回源还是抢锁。**不在这里打日志** —— miss 是正常路径，打日志会刷屏。
+	getCached := func(ctx context.Context) (*Video, error) {
+		opCtx, cancel := context.WithTimeout(ctx, detailCacheOpTimeout)
+		defer cancel()
+		raw, err := vs.cache.GetBytes(opCtx, cacheKey)
+		if err != nil {
+			return nil, err
+		}
+		var v Video
+		if err := json.Unmarshal(raw, &v); err != nil {
+			return nil, err
+		}
+		return &v, nil
+	}
+
+	// setCached：回填缓存，尽力而为。写失败只记日志 —— 数据已经查出来了，
+	// 因为缓存写不进去就把这个请求判失败，是本末倒置。
+	setCached := func(ctx context.Context, v *Video) {
+		raw, err := json.Marshal(v)
+		if err != nil {
+			return
+		}
+		// 用独立的 ctx：调用方的 ctx 可能在这时候已经因为客户端断开被取消了，
+		// 但"查询已经完成、把结果存进缓存"这件事仍然值得做完（下一个请求就能命中）
+		opCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), detailCacheOpTimeout)
+		defer cancel()
+		if err := vs.cache.SetBytes(opCtx, cacheKey, raw, vs.cacheTTL); err != nil {
+			log.Printf("[video] 回填详情缓存失败 id=%d: %v", id, err)
+		}
+	}
+
+	// ---------- ① 读缓存 ----------
+	if v, err := getCached(ctx); err == nil {
+		return v, nil
+	}
+
+	// ---------- ② 二次裸读：裁决「真未命中」还是「Redis 故障」 ----------
+	probeCtx, cancelProbe := context.WithTimeout(ctx, detailCacheOpTimeout)
+	probeRaw, probeErr := vs.cache.GetBytes(probeCtx, cacheKey)
+	cancelProbe()
+
+	switch {
+	case probeErr == nil:
+		// 两次读之间别人刚回填好了 —— 直接用，锁都不用抢
+		var v Video
+		if err := json.Unmarshal(probeRaw, &v); err == nil {
+			return &v, nil
+		}
+		// 反序列化失败 = 缓存里是脏数据。往下走：抢锁 → 双检失败 → 回源，
+		// 回源后 setCached 会把脏数据覆盖掉，等于顺手修好了
+	case !rediscache.IsMiss(probeErr):
+		// Redis 故障（超时/拒连/权限）：抢锁也会失败，直接回源
+		v, err := vs.repo.GetByID(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		setCached(ctx, v)
+		return v, nil
+	}
+
+	// ---------- ③ 真未命中：抢防击穿锁，只放一个人去回源 ----------
+	lockKey := "lock:" + cacheKey // 锁 key 就是缓存 key 加前缀，一眼能看出锁的是谁
+	lockCtx, cancelLock := context.WithTimeout(ctx, detailCacheOpTimeout)
+	token, locked, err := vs.cache.Lock(lockCtx, lockKey, detailLockTTL)
+	cancelLock()
+	if err != nil {
+		// 锁操作本身出错（Redis 抖动）：不阻塞主流程，直接回源
+		return vs.repo.GetByID(ctx, id)
+	}
+
+	if locked {
+		// 释放用 Lua「GET==token 才 DEL」——见 Unlock 的实现。
+		// 用 Background：请求可能已经结束/取消，锁还是必须放掉，
+		// 否则要等满 2s TTL 才自动过期，期间所有并发请求都在空转
+		defer func() {
+			unlockCtx, cancel := context.WithTimeout(context.Background(), detailCacheOpTimeout)
+			defer cancel()
+			_ = vs.cache.Unlock(unlockCtx, lockKey, token)
+		}()
+
+		// 双重检查：从「读到 miss」到「抢到锁」之间有窗口期，
+		// 前一个持锁者可能已经回填完了。不复查就会重复查 DB
+		if v, err := getCached(ctx); err == nil {
+			return v, nil
+		}
+
+		v, err := vs.repo.GetByID(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		setCached(ctx, v)
+		return v, nil
+	}
+
+	// ---------- ④ 没抢到锁：别人正在回源，轮询等一下 ----------
+	for i := 0; i < detailLockWaitRounds; i++ {
+		select {
+		case <-ctx.Done():
+			// ctx 感知很重要：客户端已经断开就别再空转 100ms 了
+			return nil, ctx.Err()
+		case <-time.After(detailLockWaitStep):
+		}
+		if v, err := getCached(ctx); err == nil {
+			return v, nil
+		}
+	}
+
+	// ---------- ⑤ 等不到（持锁者挂了 / DB 特别慢）：自己兜底 ----------
+	// 宁可多打一次 DB，也不能不响应。这就是"防击穿"和"分布式事务"的区别 ——
+	// 前者只保证**通常情况**下回源被收敛成一次，不保证严格唯一
+	v, err := vs.repo.GetByID(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	setCached(ctx, v)
+	return v, nil
 }
 
 // UpdateLikesCount 用指定值覆盖计数（阶段4 LikeWorker 用）
+//
+// **缓存失效不在这里做**（阶段8 回填）。这里只写 MySQL，缓存里的 likes_count
+// 会在 TTL 内是旧值 —— 见 UpdatePopularity 上的说明，两个方法共用同一套失效逻辑。
 func (vs *VideoService) UpdateLikesCount(ctx context.Context, id uint, likesCount int64) error {
 	return vs.repo.UpdateLikesCount(ctx, id, likesCount)
 }
 
 // UpdatePopularity 热度增减（数据库端原子 + 下限0）。
-// 阶段8/9回填：先试 popularityMQ 事件；失败或未启用时写 Redis 热榜分钟桶（ZincrBy + 2h 过期）
+//
+// 阶段8/9回填：先试 popularityMQ 事件；失败或未启用时写 Redis 热榜分钟桶
+// （ZincrBy + 2h 过期）+ 连带失效 detail/entity 两个缓存 —— 那段逻辑落在
+// internal/video/popularity_cache.go 的 UpdatePopularityCache。
+//
+// ---------- 一个必须知道的"脏读窗口"（阶段7 的已知取舍） ----------
+//
+// 点赞链路（LikeService.Like）是在**事务里**直接 ChangeLikesCountTx，
+// 根本不经过这个方法。所以现在：点赞后 /video/getDetail 返回的 likes_count
+// 最多会旧 5 分钟（detailCacheTTL），直到缓存自然过期。
+//
+// 这不是漏写，是顺序问题：点赞的失效要等阶段9 的 PopularityWorker 把事件
+// 消费到、调 UpdatePopularityCache 才闭环。原项目也是这个顺序。
+// 真要在阶段7 就补，正确做法是给 LikeService 也注入 cache、事务 commit
+// 之后 DEL 详情 key —— 但那样 stage 8/9 会被重复失效，所以这里先按下不表。
 func (vs *VideoService) UpdatePopularity(ctx context.Context, id uint, change int64) error {
 	return vs.repo.UpdatePopularity(ctx, id, change)
 }

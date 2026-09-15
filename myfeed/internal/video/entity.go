@@ -40,6 +40,79 @@ type Video struct {
 	// 不报错、只是搜索慢慢变垃圾）。代价只是两列可空的 varchar/datetime。
 	EmbeddingModel *string    `gorm:"type:varchar(64)" json:"-"`
 	EmbeddedAt     *time.Time `json:"-"`
+
+	// ---------- 扩展：上传质量门禁与转码（本轮新增）----------
+	//
+	// ⚠ **这里的 json tag 是行为决定，不是细节。** 同一个理由上面已经写过一次：
+	// PublishVideo / GetDetail / ListByAuthorID 三处都是把裸 Video 丢给 c.JSON 的。
+	// 所以每个新列都要显式回答一个问题：**前端该不该看见它？**
+	//
+	//	该看见 → transcode_status、hls_url   （前端要靠它选 hls.js 还是直传）
+	//	不该看 → src_*、probe_status、hls_dir
+	//
+	// 判断标准是"前端拿到它会不会改变行为"。`src_bitrate_kbps` 是运营/
+	// 排查用的，前端拿到它什么也不会做，那它出现在每个视频响应里就是噪音 ——
+	// 而且会和前端 api/video.ts 的 VideoItem 悄悄漂移（TS 那边永远不会报错）。
+
+	// SrcWidth / SrcHeight 源素材的画面尺寸。`json:"-"`。
+	// 探测失败时为 0 —— 所以**不能**用 0 表示"不知道分辨率的 0×0 视频"，
+	// 那本来也不存在。判据是 probe_status。
+	SrcWidth  int `gorm:"not null;default:0" json:"-"`
+	SrcHeight int `gorm:"not null;default:0" json:"-"`
+
+	// SrcBitrateKbps 源素材的**整体**码率（含音轨）。`json:"-"`。
+	// 它就是这套门禁要解决的那个量：值完全由上传者决定。
+	SrcBitrateKbps int `gorm:"not null;default:0" json:"-"`
+
+	// SrcDurationMS 源素材时长。`json:"-"`。
+	// 不参与转码判定，但**是排查时第一个要看的东西** ——
+	// 码率算错、时长明显不符，都指向探测本身有问题。
+	SrcDurationMS int64 `gorm:"not null;default:0" json:"-"`
+
+	// ProbeStatus 探测结果：""（没探过）/ "ok" / "failed"。`json:"-"`。
+	//
+	// 单独一列而不是"用 src_bitrate_kbps==0 表示失败"，因为 0 有歧义：
+	// 探测成功但时长为 0 的畸形文件也是 0。有了这一列，
+	// "为什么这条被跳过了"才是一个能用 SQL 直接问出来的问题。
+	ProbeStatus string `gorm:"type:varchar(16);not null;default:''" json:"-"`
+
+	// TranscodeStatus 转码状态机，**要暴露给前端**。
+	//
+	//	""          存量数据，从没经过门禁（111 条都是这个）
+	//	"skipped"   探明了，低于阈值 → 直传原文件
+	//	"pending"   已入队，等 worker 领
+	//	"running"   正在转
+	//	"ready"     HLS 三档就绪，hls_url 可用
+	//	"failed"    转码失败 → **仍然直传原文件**（前端按 hls_url 是否为空决定走哪条路）
+	//
+	// 前端只关心一件事：**hls_url 是不是空的**。这个列是给运营和排查看的
+	// （"有多少条卡在 pending"是一个必须能一眼看到的问题）。
+	//
+	// "failed" 不等于"不能播" —— 这一点容易搞混。转码失败的那条视频
+	// 依旧走直传路径正常播放，只是没有多档可选。
+	TranscodeStatus string `gorm:"type:varchar(16);not null;default:''" json:"transcode_status"`
+
+	// HlsURL HLS 播放列表的**路径**（不是完整 URL）。要暴露给前端。
+	//
+	// 空字符串 ≡ "这条走直传 mp4" —— 前端只用这一个判据。
+	//
+	// ⚠ 存路径而不是完整 URL：`staticURL()`（前端 api/video.ts）拼的是
+	// 站点根 + pathname，把 host 烤进数据库会让换域名/端口时全表失效。
+	// 和既有的 PlayURL / CoverURL 完全一致。
+	//
+	// 注意它指向的是 **master.m3u8**，而那个文件在阶段 E 会变成
+	// **服务端现场生成**的（过载时只列低档）。所以这个值是"入口"，
+	// 不是"文件位置"——文件位置在 HlsDir。
+	HlsURL string `gorm:"type:varchar(255);not null;default:''" json:"hls_url"`
+
+	// HlsDir 转码产物的**磁盘目录**。`json:"-"`。
+	//
+	// 为什么单独存一份而不从 ID 推：可以推（就是 uploads/hls/{id}），
+	// 但"能推出来"和"存下来"的区别在于**改动时的爆炸半径** ——
+	// 推的话，改一次目录规则就等于全表数据的位置都变了，而没有任何地方
+	// 记录着"它原来在哪"。存下来，清理任务和排查都能直接读到事实。
+	// 代价是一个 varchar(255)。
+	HlsDir string `gorm:"type:varchar(255);not null;default:''" json:"-"`
 }
 
 type PublishVideoRequest struct {
@@ -119,3 +192,31 @@ type OutboxMsg struct {
 	CreateTime time.Time `gorm:"autoCreateTime"`
 	Status     string    `gorm:"type:varchar(50);index"`
 }
+
+// outbox 的事件类型。**这两个常量必须和 pollOnce 的分流一一对应。**
+//
+// ---------- ⚠ EventType 曾经是个死字段 ----------
+//
+// 在加转码之前，`pollOnce`（internal/worker/outboxworker.go）查的是
+// `status='pending'`，然后**无条件**调 TimelineMQ.PublishVideo ——
+// 它从不读 EventType。也就是说这个列当时写着有值，但**没有任何读者**。
+//
+// 那个状态下加第二种事件是**静默出错**的：新写的
+// `video_transcode` 行会被同一段代码捞出来，当成"视频已发布"投进时间线队列，
+// 于是转码消息变成了一个 id 重复的 TimelineEvent，而真正的转码任务
+// 永远不会被执行 —— 两个队列都不会报错。
+//
+// 所以本轮**必须同时**做两件事：写新事件类型 + 把 pollOnce 改成按 EventType 分流。
+// 只做前一件等于埋一颗不响的雷。
+const (
+	// EventTypeVideoPublished 发布 → 进时间线。**沿用既有字面量**，
+	// 改了会让存量 pending 行（如果有）被 pollOnce 的分流判成未知类型。
+	EventTypeVideoPublished = "video_published"
+
+	// EventTypeVideoTranscode 发布 → 入队转码。
+	//
+	// 用下划线而不是点号（`video.transcode`）：既有值是 video_published，
+	// 两套风格并存的话，将来按前缀做路由/过滤时会漏掉一半。
+	// 一致性比"哪个更好看"重要。
+	EventTypeVideoTranscode = "video_transcode"
+)

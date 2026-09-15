@@ -17,8 +17,20 @@ import "time"
 // 通知类型。用常量而不是到处散字符串字面量 —— 阶段10 的 SSE 推送要按 Type 分流，
 // 那时拼错一个 "mention" 不会编译报错，只会在运行时静默不推。
 const (
-	TypeMention = "mention" // 评论里 @ 了你（阶段5）
-	// 阶段9回填：TypeComment = "comment"（评论了你的视频）、TypeFollow = "follow"（关注了你）
+	TypeMention = "mention" // 评论里 @ 了你（阶段5，同步写，不走 MQ）
+	TypeLike    = "like"    // 点赞了你的视频（阶段9，走 MQ）
+	TypeComment = "comment" // 评论了你的视频（阶段9，走 MQ）
+	TypeFollow  = "follow"  // 关注了你（阶段9，走 MQ）
+
+	// 为什么 like/comment/follow 三个走 MQ，而 mention 不走：
+	// 前三者的触发动作本身就是异步的（点赞/评论落库在 worker 里），
+	// 通知顺手在同一个消费流程里写掉是**零额外成本**；
+	// 而 mention 是评论内容的一部分 —— 它要知道"这条评论里 @ 了谁"，
+	// 那是**评论正文的语义**，MQ 事件里得把解析结果或者原文带过去。
+	// 原项目选了"留在同步路径里直接查账号表 + INSERT"。
+	//
+	// 代价是一处不一致（comment_service.go 里已如实记下）：
+	// 走 MQ 时评论还没落库，mention 通知却已经发出去了。
 )
 
 // Notification 一条通知。表名 notifications（GORM 按结构体复数推导）。

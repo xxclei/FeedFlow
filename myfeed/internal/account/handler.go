@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"myfeed/internal/apierror"
+	"myfeed/internal/config"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
@@ -21,10 +22,12 @@ import (
 // AccountHandler 只做三件事：绑定参数、定状态码、调 service。不写任何业务
 type AccountHandler struct {
 	accountService *AccountService
+	// storage 只给 UploadAvatar 算落地目录用（见 config/paths.go 的 AvatarsDir）
+	storage config.StorageConfig
 }
 
-func NewAccountHandler(accountService *AccountService) *AccountHandler {
-	return &AccountHandler{accountService: accountService}
+func NewAccountHandler(accountService *AccountService, storage config.StorageConfig) *AccountHandler {
+	return &AccountHandler{accountService: accountService, storage: storage}
 }
 
 // CreateAccount POST /account/register
@@ -178,8 +181,10 @@ func (h *AccountHandler) UploadAvatar(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "only .jpg/.jpeg/.png/.webp allowed"})
 		return
 	}
-	// 存到 .run/uploads/avatars/<accountID>/（.gitignore 已忽略 .run/）
-	dir := filepath.Join(".run", "uploads", "avatars", strconv.FormatUint(uint64(accountID), 10))
+	// 存到 <UploadRoot>/avatars/<accountID>/（.gitignore 已忽略 .run/）。
+	// 用 storage.AvatarsDir 而不是自己拼 —— 头像不在门禁的链路上，
+	// 但它和视频共用同一个根目录，根目录换地方时这里跟着走才不会漏。
+	dir := h.storage.AvatarsDir(accountID)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return

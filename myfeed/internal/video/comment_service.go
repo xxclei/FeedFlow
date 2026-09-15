@@ -9,6 +9,8 @@ import (
 
 	"myfeed/internal/account"
 	"myfeed/internal/apierror"
+	"myfeed/internal/middleware/rabbitmq"
+	rediscache "myfeed/internal/middleware/redis"
 	"myfeed/internal/notification"
 
 	"gorm.io/gorm"
@@ -16,16 +18,20 @@ import (
 
 // CommentService 评论业务：发表 / 删除 / 列出，外加一个副作用（@提及通知）。
 //
-// 本阶段（阶段5）只有一条路径：**直写事务**。阶段9 会在这条路径前面插一层
-// "先试 MQ 投递，失败才落到这里"，那时的顺序是：
+// 阶段9 起有**两条路径**，排序是"先试 MQ，失败才落到直写"：
 //
-//	mysqlEnqueued  := commentMQ.Publish(...)      // 评论落库交给 Worker
-//	redisEnqueued  := popularityMQ.Update(+1)     // 热度交给 Worker
+//	mysqlEnqueued  := commentMQ.Publish(...)      // 评论落库交给 CommentWorker
+//	redisEnqueued  := popularityMQ.Update(+1)     // 热度交给 PopularityWorker
 //	两个都成功 → notifyMentions 后直接 return（下面的直写整段跳过）
-//	否则       → 落到下面的直写事务（就是现在这段代码，一行都不用删）
+//	否则       → 落到 publishMySQLDirect / deleteMySQLDirect
 //
-// 所以下面的直写**不是临时代码，它是永久的降级路径**。阶段5 不写 MQ 分支
-// （写了也是死代码），等阶段9 再插。
+// 所以那两个 Direct 方法**不是临时代码，它们是永久的降级路径**
+// （commentMQ 为 nil 或投递失败时全靠它们），永远不会被删掉。
+//
+// 范式 A（和点赞一样）：**MQ 是唯一写路径，直写只是降级**。
+// 换来的是"用户不用等落库"，代价是"评论发出去、刷新可能还没出现"。
+// 对照 social 模块的范式 B（DB 同步写 + MQ 冗余），那里选了强一致，
+// 理由是关注是低频写、削峰没收益（见 internal/social/service.go 的说明）。
 type CommentService struct {
 	repo      *CommentRepository
 	videoRepo *VideoRepository
@@ -41,28 +47,38 @@ type CommentService struct {
 	// notificationRepo 是"通知表怎么写"的唯一入口。见 notification/repo.go
 	// 上关于原项目裸 Table("notifications") 的说明。
 	notificationRepo *notification.NotificationRepository
+
+	// cache 阶段8 接进来的（热榜写路径）。**可以为 nil** —— 启动时 Redis
+	// Ping 失败就是 nil，UpdatePopularityCache 自己 guard 掉，评论照常发出。
+	cache *rediscache.Client
+
+	// commentMQ 承接"评论落库"那一半；popularityMQ 承接"热度"那一半。
+	// 两个都可以为 nil（启动降级），nil 的语义是"这条路走不了，去走直写"。
+	commentMQ    *rabbitmq.CommentMQ
+	popularityMQ *rabbitmq.PopularityMQ
 }
 
-// NewCommentService 阶段5 四个依赖。
-//
-// 文档给的签名是 5 个参数（repo, videoRepo, cache, commentMQ, popularityMQ，
-// 后三个本阶段传 nil），但 rediscache / rabbitmq 两个包现在还不存在、类型都没有，
-// 写不出来。和阶段4 的 NewLikeService 同一个处理：建包时再把参数补上。
+// NewCommentService 阶段9：七个依赖到齐（阶段5 四个 → 阶段8 加 cache → 本轮加两个 MQ）。
 //
 // 多出来的两个（accountRepo / notificationRepo）是文档版没有的 —— 因为原项目
-// 用裸 db 查询代替了它们。那两个包建好之后，这个签名会变成 7 个参数，
-// 那是阶段7/9 的事。
+// 用裸 db 查询代替了它们。
 func NewCommentService(
 	repo *CommentRepository,
 	videoRepo *VideoRepository,
 	accountRepo *account.AccountRepository,
 	notificationRepo *notification.NotificationRepository,
+	cache *rediscache.Client,
+	commentMQ *rabbitmq.CommentMQ,
+	popularityMQ *rabbitmq.PopularityMQ,
 ) *CommentService {
 	return &CommentService{
 		repo:             repo,
 		videoRepo:        videoRepo,
 		accountRepo:      accountRepo,
 		notificationRepo: notificationRepo,
+		cache:            cache,
+		commentMQ:        commentMQ,
+		popularityMQ:     popularityMQ,
 	}
 }
 
@@ -106,14 +122,77 @@ func (s *CommentService) Publish(ctx context.Context, comment *Comment) error {
 		return errors.New("video not found")
 	}
 
-	// 事务：插评论 + 热度 +1，同生共死。
+	// ===== 阶段9：降级矩阵（范式 A，与 like_service.go 逐行同构）=====
 	//
-	// 阶段4 的 tx 逃逸教训在这里直接兑现：闭包里三个调用
-	// （IsExistTx / CreateCommentTx / ChangePopularityTx）**全部显式吃 tx**。
-	// 少一个 Tx 后缀，那条语句就会跑到事务外的那条连接上立刻提交 ——
-	// 事务回滚了它也不回滚，留下"评论没插进去、热度已经 +1"的鬼数据。
-	// 这个 repo 干脆不提供非 Tx 的写方法，就是为了让这种错**写不出来**。
-	if err := s.repo.Transaction(ctx, func(tx *gorm.DB) error {
+	// 两条腿各试各的，**只对失败的那条腿降级**：
+	//
+	//	commentMQ    承接"评论落库 + MySQL 热度 +1"（事务整体搬去 CommentWorker）
+	//	popularityMQ 承接"Redis 分钟桶 +1"
+	//
+	// 注意两个 err 都**不向上返回**：发布失败不是业务失败。
+	// 消息没发出去，用户的操作照样可以成功 —— 我们改用同步直写补上就是了。
+	// 把它当错误返回，等于让一次 MQ 抖动变成一个用户可见的失败。
+	mysqlEnqueued, redisEnqueued := false, false
+
+	if s.commentMQ != nil {
+		if err := s.commentMQ.Publish(ctx, comment.Username, comment.VideoID, comment.AuthorID, comment.Content); err == nil {
+			mysqlEnqueued = true
+		} else {
+			log.Printf("[comment] Publish 投递失败, 降级为同步直写: video=%d, err=%v", comment.VideoID, err)
+		}
+	}
+
+	if s.popularityMQ != nil {
+		if err := s.popularityMQ.Update(ctx, comment.VideoID, +1); err == nil {
+			redisEnqueued = true
+		} else {
+			log.Printf("[comment] Popularity 投递失败, 降级为同步直写: video=%d, err=%v", comment.VideoID, err)
+		}
+	}
+
+	if !mysqlEnqueued {
+		if err := s.publishMySQLDirect(ctx, comment); err != nil {
+			return err
+		}
+	}
+
+	// 阶段8：热度进 Redis 分钟桶 + 失效两个详情缓存。
+	//
+	// 同步版里它排在事务提交之后，理由见 popularity_cache.go 文件头
+	// （Redis 不能回滚，只能等 MySQL 尘埃落定）。异步版里这个顺序由
+	// **两个独立队列**保证不了 —— 但也不需要保证：popularityMQ 只动 Redis，
+	// commentMQ 只动 MySQL，两条腿互不依赖，谁先谁后结果都一样。
+	if !redisEnqueued {
+		UpdatePopularityCache(ctx, s.cache, comment.VideoID, +1)
+	}
+
+	// 副作用放在**写路径之后**，这是有顺序要求的：
+	// 放进事务里，通知就和评论绑成命运共同体了 ——
+	// 通知表写失败会让一条本来能发表的评论回滚，说不通。
+	//
+	// 阶段9 遗留的一处不一致（原注释已提醒，这里如实记下）：
+	// 走 MQ 路径时评论**还没落库**就已经发通知了，极端情况下可能
+	// "通知已发、评论最终没落库"。要修就得让通知也走 MQ（本项目没做）。
+	// 另外 comment.ID 在 MQ 路径下仍是 0 —— 但 notifyMentions 只用
+	// AuthorID/Username/Content/VideoID，不碰 ID，所以这里安全。
+	s.notifyMentions(ctx, comment)
+	return nil
+}
+
+// publishMySQLDirect 是 Publish 的**同步降级路径**，也是阶段9 之前的唯一路径。
+//
+// 它**不是临时代码**：commentMQ 为 nil（RabbitMQ 启动时连不上）或投递失败时，
+// 评论落库就走这里。所以这段代码永远不会被删掉，它是永久保底。
+//
+// 事务：插评论 + 热度 +1，同生共死。
+//
+// 阶段4 的 tx 逃逸教训在这里直接兑现：闭包里三个调用
+// （IsExistTx / CreateCommentTx / ChangePopularityTx）**全部显式吃 tx**。
+// 少一个 Tx 后缀，那条语句就会跑到事务外的那条连接上立刻提交 ——
+// 事务回滚了它也不回滚，留下"评论没插进去、热度已经 +1"的鬼数据。
+// 这个 repo 干脆不提供非 Tx 的写方法，就是为了让这种错**写不出来**。
+func (s *CommentService) publishMySQLDirect(ctx context.Context, comment *Comment) error {
+	return s.repo.Transaction(ctx, func(tx *gorm.DB) error {
 		exist, err := s.videoRepo.IsExistTx(tx, comment.VideoID)
 		if err != nil {
 			return err
@@ -123,26 +202,19 @@ func (s *CommentService) Publish(ctx context.Context, comment *Comment) error {
 		}
 
 		// CreatedAt 交给 gorm:"autoCreateTime" 填（不像 Like 那样显式赋值）。
-		// 差别在于：阶段9 的 LikeWorker 要能覆盖"事件发生时刻"，
-		// 而评论的 publish 事件带的是完整内容、Worker 会新建一条评论行，
-		// 那时再决定时间戳从哪来（原项目也是自动填）。
+		// 差别在于：CommentWorker 消费 publish 事件时会**新建一条评论行**，
+		// 而事件里没有发生时刻字段可用到的地方 —— 用的是消费时刻。
+		// 这是异步化的一处真实代价：评论的 createdAt 变成"worker 处理它的时刻"，
+		// 而不是"用户点发表的时刻"。误差 = 队列积压时长，正常时 ~10ms。
 		if err := s.repo.CreateCommentTx(tx, comment); err != nil {
 			// 这里**没有** isDupKey 分支 —— 不是漏了，是没有唯一索引可撞。
 			// 评论允许一人对同一视频发多条，重复提交就是两条评论，产品语义如此。
-			// 缺少 1062 这道防线，是评论模块比点赞弱一档的地方（阶段9 讨论
-			// MQ 重复消费时会回到这个问题：事件里有 EventID，但没有去重表）。
+			// 缺少 1062 这道防线，是评论模块比点赞弱一档的地方：
+			// **MQ 重复投递同一条 publish 事件会真的插出两条评论**（无幂等闸门）。
 			return err
 		}
 		return s.videoRepo.ChangePopularityTx(tx, comment.VideoID, +1)
-	}); err != nil {
-		return err
-	}
-
-	// 副作用放在**事务提交之后**，这是有顺序要求的：
-	// 放进上面的事务里，通知就和评论绑成命运共同体了 ——
-	// 通知表写失败会让一条本来能发表的评论回滚，说不通。
-	s.notifyMentions(ctx, comment)
-	return nil
+	})
 }
 
 // Delete 删评论。**属主校验在这一层，而且必须在任何删除动作之前**。
@@ -173,6 +245,67 @@ func (s *CommentService) Delete(ctx context.Context, commentID uint, accountID u
 		return apierror.ErrForbidden
 	}
 
+	// ===== 阶段9：降级矩阵（与 Publish 同构）=====
+	//
+	// 权限校验**在上面、已经做完了**，这一点是刻意的：事件里只有 commentID
+	// 和 videoID，Worker 无从知道"是谁在删"——它既没有请求上下文，
+	// 也没有义务做安全判断。**安全校验只能在有身份的地方做，而有身份的地方就是这里。**
+	mysqlEnqueued, redisEnqueued := false, false
+
+	if s.commentMQ != nil {
+		if err := s.commentMQ.Delete(ctx, commentID, comment.VideoID); err == nil {
+			mysqlEnqueued = true
+		} else {
+			log.Printf("[comment] Delete 投递失败, 降级为同步直写: comment=%d, err=%v", commentID, err)
+		}
+	}
+
+	if s.popularityMQ != nil {
+		if err := s.popularityMQ.Update(ctx, comment.VideoID, -1); err == nil {
+			redisEnqueued = true
+		} else {
+			log.Printf("[comment] Popularity 投递失败, 降级为同步直写: video=%d, err=%v", comment.VideoID, err)
+		}
+	}
+
+	if !mysqlEnqueued {
+		if err := s.deleteMySQLDirect(ctx, comment); err != nil {
+			return err
+		}
+	}
+
+	// 阶段8：Redis 侧也 -1。
+	//
+	// **这一步是必须的，不是为了对称好看**：同步路径里的 ChangePopularityTx(-1)
+	// 是阶段5 补的（原项目删评论不回扣热度，这里当作已知瑕疵修掉了）。
+	// 如果 Redis 侧不跟着 -1，那么"发一条评论再删掉"之后：
+	//   MySQL popularity 回到原值，Redis 桶里却永远留着那 +1 ——
+	//   同一次操作在两条链路上给出不同的历史，而且 Redis 这份**永远不会自愈**
+	//   （桶有 TTL，但只影响过期，不影响存活期内那 60 分钟的榜单是错的）。
+	//
+	// 口径提醒：删评论**不校验**评论作者以外的东西，视频被删也照扣 ——
+	// 命中 0 行/写进一个没人读的桶，都自洽。
+	if !redisEnqueued {
+		UpdatePopularityCache(ctx, s.cache, comment.VideoID, -1)
+	}
+	return nil
+}
+
+// deleteMySQLDirect 是 Delete 的**同步降级路径**，也是阶段9 之前的唯一路径。
+//
+// ⚠ 这里藏着阶段9 一处**真实的语义降级**，必须说清楚：
+//
+// 下面那道 `RowsAffected` 检查（并发删同一条评论时不能扣两次热度）
+// 只有走这条路才生效。走 MQ 路径时，这个检查搬到了 CommentWorker 里 ——
+// 而 Worker 的 `DeleteCommentTx` 影响 0 行时**是静默通过的**（幂等语义，
+// 见 SocialService.Unfollow 注释里"接口层报错、异步层幂等"的区分）。
+// 于是：**并发删同一条评论时，热度有可能被扣两次。**
+//
+// 这不是笔误，是范式 A 的固有代价，和点赞那边"幂等闸门挡住重复"不完全一样
+// —— 点赞有唯一索引天然兜底，评论删除没有。要修得在 Worker 里补一条
+// "rowsAffected==0 时不再 ChangePopularity"的判断（本项目做了，见
+// internal/worker/comment_worker.go 的 applyDelete）。
+func (s *CommentService) deleteMySQLDirect(ctx context.Context, comment *Comment) error {
 	return s.repo.Transaction(ctx, func(tx *gorm.DB) error {
 		// 删评论。**必须看 RowsAffected**：DELETE 影响 0 行不是错误，err 是 nil。
 		// 两个并发删除请求各自 GetByID 成功、各自删、各自给热度 -1，
@@ -189,11 +322,11 @@ func (s *CommentService) Delete(ctx context.Context, commentID uint, accountID u
 
 		// 热度 -1：**原项目缺的一步，这里补上**（文档 Q5 把它记为已知瑕疵）。
 		//
-		// 为什么原项目补不了：阶段9 的 delete 事件里只带了 commentID，
+		// 为什么原项目补不了：它的 delete 事件里只带了 commentID，
 		// Worker 还得先 GetByID 查回评论才知道 videoID，而它没做这一步 ——
-		// 教训是"**事件里要带够上下文**"。我们这里是同步的、评论对象就在手上，
-		// 所以 videoID 是免费的。但这也意味着：阶段9 改造后，事件里必须带上 videoID，
-		// 否则这个 -1 在 MQ 路径下会丢。
+		// 教训是"**事件里要带够上下文**"。
+		// 本项目的 CommentEvent **把 videoID 一起带上了**（见 commentMQ.go 上
+		// 那段关于"必须的偏离"的说明），所以 MQ 路径下这个 -1 不会丢。
 		//
 		// 不查"视频还在不在"：视频已被删的话，这条 UPDATE 命中 0 行、
 		// 不报错也不改任何东西，结果自洽 —— 和 Unlike 不做存在性检查同一个理由。

@@ -13,6 +13,7 @@ import (
 
 	"myfeed/internal/account"
 	"myfeed/internal/apierror"
+	"myfeed/internal/config"
 	"myfeed/internal/middleware/jwt"
 
 	"github.com/gin-gonic/gin"
@@ -22,10 +23,13 @@ import (
 type VideoHandler struct {
 	service        *VideoService
 	accountService *account.AccountService // 原项目如此：实际未使用（死依赖），保留签名对齐
+	// storage 只用来算落地目录。**不要在这里拼 "videos/<id>/<date>/"** ——
+	// 布局的唯一来源是 config.StorageConfig.VideosDir，理由见 config/paths.go。
+	storage config.StorageConfig
 }
 
-func NewVideoHandler(service *VideoService, accountService *account.AccountService) *VideoHandler {
-	return &VideoHandler{service: service, accountService: accountService}
+func NewVideoHandler(service *VideoService, accountService *account.AccountService, storage config.StorageConfig) *VideoHandler {
+	return &VideoHandler{service: service, accountService: accountService, storage: storage}
 }
 
 // PublishVideo POST /video/publish（JWT）
@@ -89,12 +93,12 @@ func (vh *VideoHandler) UploadVideo(c *gin.Context) {
 		return
 	}
 
-	// 目录结构：.run/uploads/videos/<作者ID>/<日期>/ —— 按日期分目录，
-	// 避免单目录塞几十万文件拖垮文件系统
+	// 目录结构：<UploadRoot>/videos/<作者ID>/<日期>/ —— 按日期分目录，
+	// 避免单目录塞几十万文件拖垮文件系统。
+	// 布局由 config.StorageConfig.VideosDir 独家定义（含 UploadRoot 的兜底），
+	// 这里**不拼字符串** —— 门禁探测读的是配置里的根目录，两边必须同源。
 	date := time.Now().Format("20060102")
-	relDir := filepath.Join("videos", fmt.Sprintf("%d", authorId), date)
-	root := filepath.Join(".run", "uploads")
-	absDir := filepath.Join(root, relDir)
+	absDir := vh.storage.VideosDir(authorId, date)
 	if err := os.MkdirAll(absDir, 0o755); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -150,9 +154,7 @@ func (vh *VideoHandler) UploadCover(c *gin.Context) {
 	}
 
 	date := time.Now().Format("20060102")
-	relDir := filepath.Join("covers", fmt.Sprintf("%d", authorId), date)
-	root := filepath.Join(".run", "uploads")
-	absDir := filepath.Join(root, relDir)
+	absDir := vh.storage.CoversDir(authorId, date)
 	if err := os.MkdirAll(absDir, 0o755); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return

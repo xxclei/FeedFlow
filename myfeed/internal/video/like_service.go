@@ -5,25 +5,57 @@ import (
 	"errors"
 	"time"
 
+	rabbitmq "myfeed/internal/middleware/rabbitmq"
+	rediscache "myfeed/internal/middleware/redis"
+
 	"gorm.io/gorm"
 )
 
-// LikeService 点赞业务。本阶段（阶段4）只有**一条**路径：直写事务。
+// LikeService 点赞业务。阶段9 起有**两条**路径，按目标分别降级：
 //
-// 阶段7/9 会插进来另外三个依赖（cache / likeMQ / popularityMQ），那时的顺序是
-// "先试 MQ 投递，失败再降级到这里的直写事务"。所以下面这段直写代码**不是临时代码，
-// 它是永久的降级路径** —— 阶段9 接完 MQ，它一行都不用删。
-// 本阶段不写 MQ 分支（写了也是死代码），等阶段9 再插。
+//	正常：publish 到 MQ → 立即返回（接口不等 MySQL、不等 Redis）
+//	降级：哪条 publish 失败，就走对应那条同步直写
+//
+// 下面这段直写代码**不是临时代码，它是永久的降级路径** ——
+// MQ 全挂的时候点赞功能一条不缺，只是慢回同步的老样子。
+//
+// 五个依赖里有三个**可以为 nil**（cache / likeMQ / popularityMQ），
+// 全部对应"启动时该组件不可用"：Redis Ping 失败 → cache=nil，
+// RabbitMQ 连不上 → 两个 MQ=nil。nil 一多，最容易犯的错是
+// 忘了判空导致点赞直接 panic —— 所以每个分支都显式判 nil，
+// 而 nil 的语义是"这条路走不了，去走降级路"，不是"出错了"。
 type LikeService struct {
 	repo      *LikeRepository
 	videoRepo *VideoRepository
+
+	// cache 阶段8 接进来的（热榜写路径）。**可以为 nil** —— 启动时 Redis Ping
+	// 失败就是 nil，此时 UpdatePopularityCache 自己 guard 掉，点赞照常成功。
+	cache *rediscache.Client
+
+	// likeMQ 承接"落 MySQL"那一半；popularityMQ 承接"更新 Redis 热榜"那一半。
+	// 两条腿故意分开（文档 Q2）：目标不同、失败域不同，能独立降级。
+	likeMQ       *rabbitmq.LikeMQ
+	popularityMQ *rabbitmq.PopularityMQ
 }
 
-// NewLikeService 阶段4 只有两个依赖。
-// 文档给的签名是 5 个参数（后三个传 nil），但 rediscache / rabbitmq 两个包现在
-// 还不存在、类型都没有，写不出来；阶段7/9 建包时再把参数补上。
-func NewLikeService(repo *LikeRepository, videoRepo *VideoRepository) *LikeService {
-	return &LikeService{repo: repo, videoRepo: videoRepo}
+// NewLikeService 阶段9：五个依赖到齐（阶段4 两个 → 阶段8 加 cache → 本轮加两个 MQ）。
+//
+// 后三个都允许传 nil（启动降级），构造函数**不做判空** ——
+// nil 是这个类型的合法状态，不是错误。
+func NewLikeService(
+	repo *LikeRepository,
+	videoRepo *VideoRepository,
+	cache *rediscache.Client,
+	likeMQ *rabbitmq.LikeMQ,
+	popularityMQ *rabbitmq.PopularityMQ,
+) *LikeService {
+	return &LikeService{
+		repo:         repo,
+		videoRepo:    videoRepo,
+		cache:        cache,
+		likeMQ:       likeMQ,
+		popularityMQ: popularityMQ,
+	}
 }
 
 // Like 点赞。三层保险，一层比一层强：
@@ -63,6 +95,57 @@ func (s *LikeService) Like(ctx context.Context, like *Like) error {
 	// 那时必须能覆盖这个字段（见 like_entity.go 上的说明）。
 	like.CreatedAt = time.Now()
 
+	// ---------- 降级矩阵（文档 Q3 姿势一）----------
+	//
+	// 两个 flag **相互独立**，只对失败的那条腿降级：成功了的那条腿
+	// 已经由 MQ 接手，再同步补一遍就是重复执行。
+	// 这是"按目标独立降级"的全部含义 —— 不是全成功或全失败，
+	// 而是"哪条坏了补哪条"。
+	//
+	// 前置校验（视频存在、是否已赞）**故意留在同步路径**：
+	// 接口仍然要立刻给用户"你没赞过"这种明确答复，MQ 只承接
+	// "已经确定要做"的写。把校验也扔进 MQ 的话，用户点了半天
+	// 才知道视频不存在，体验反而退步。
+	mysqlEnqueued, redisEnqueued := false, false
+	if s.likeMQ != nil {
+		if err := s.likeMQ.Like(ctx, like.AccountID, like.VideoID); err == nil {
+			mysqlEnqueued = true
+		}
+		// 注意这里**不 return error**：发布失败不是业务失败，
+		// 只是"这条路走不了"，下面降级去直写。把发布失败当错误抛出去，
+		// 就等于把 MQ 的可用性绑成了点赞功能的可用性 —— 那 MQ 反而成了短板。
+	}
+	if s.popularityMQ != nil {
+		if err := s.popularityMQ.Update(ctx, like.VideoID, +1); err == nil {
+			redisEnqueued = true
+		}
+	}
+	if mysqlEnqueued && redisEnqueued {
+		// 两条腿都交给 MQ 了，接口到此为止 ——
+		// 这是整个阶段9 的全部收益所在：用户不必等 MySQL 提交，
+		// 也不必等 Redis 更新。
+		return nil
+	}
+
+	// 走到这里说明至少有一条腿没交出去，只补那一条。
+	if !mysqlEnqueued {
+		if err := s.likeMySQLDirect(ctx, like); err != nil {
+			return err
+		}
+	}
+	if !redisEnqueued {
+		UpdatePopularityCache(ctx, s.cache, like.VideoID, +1)
+	}
+	return nil
+}
+
+// likeMySQLDirect 是**阶段4 的直写事务，原封不动搬进来** ——
+// 连注释一起。它不是老代码，是永久降级路径：MQ 挂了、或者 publish 失败时，
+// 点赞落库必须还有一条能走通的路。
+//
+// 单独抽成方法只为让上面的降级矩阵一眼看清两条腿的分界，
+// 逻辑本身与阶段4 逐字一致。
+func (s *LikeService) likeMySQLDirect(ctx context.Context, like *Like) error {
 	return s.repo.Transaction(ctx, func(tx *gorm.DB) error {
 		// 事务内**再查一次**存在性。这一次才是防线，上面的预检只是体验：
 		// 从预检到这里之间，视频可能已经被删了。查不到就 return error → 整个事务
@@ -99,6 +182,20 @@ func (s *LikeService) Like(ctx context.Context, like *Like) error {
 	})
 }
 
+// ---------- 降级路径为什么可以放心慢？ ----------
+//
+// 阶段8 那段注释（"Redis 写必须在 Transaction 之外，否则事务回滚会让
+// Redis 往大的方向分叉"）在阶段9 有了新的意义：**MQ 天然满足这个约束**。
+// 消息是事务**提交之后**才投出去的（LikeService 里 publish 排在事务之后，
+// Worker 里更是彻底另一个进程），所以"事务回滚了但 Redis 却 +1 了"
+// 这个坏方向在 MQ 路径下**物理上不可能发生**。
+//
+// 反方向（MySQL 成功、Redis 失败）依然可能，而且依然可以接受 ——
+// 热榜少一个数不是灾难，MySQL 才是真相。
+//
+// 两句话合起来就是阶段9 的收口：
+// **MQ 没有消除不一致，它只是保证不一致一定会结束。**
+
 // Unlike 取消点赞。和 Like 几乎对称，但有三处**刻意的不对称**，每一处都有理由：
 //
 //	① 预检方向反过来：没赞过就不能取消
@@ -125,6 +222,53 @@ func (s *LikeService) Unlike(ctx context.Context, like *Like) error {
 		return errors.New("user has not liked this video")
 	}
 
+	// 降级矩阵，和 Like 逐字同构，只有 change 的符号和第二个 MQ 的方法不同。
+	// 有意保持两段代码长得一样：**对称的代码好复查**，哪天要改降级策略，
+	// 两边一起看不会漏。
+	mysqlEnqueued, redisEnqueued := false, false
+	if s.likeMQ != nil {
+		if err := s.likeMQ.Unlike(ctx, like.AccountID, like.VideoID); err == nil {
+			mysqlEnqueued = true
+		}
+	}
+	if s.popularityMQ != nil {
+		if err := s.popularityMQ.Update(ctx, like.VideoID, -1); err == nil {
+			redisEnqueued = true
+		}
+	}
+	if mysqlEnqueued && redisEnqueued {
+		return nil
+	}
+	if !mysqlEnqueued {
+		if err := s.unlikeMySQLDirect(ctx, like); err != nil {
+			return err
+		}
+	}
+	if !redisEnqueued {
+		// 阶段8：桶里 -1。位置的道理和 Like 完全一样（事务外、提交后）。
+		//
+		// ⚠ 这里会出现 Redis 侧和 MySQL 侧**口径不一致**，是已知且刻意的：
+		//   MySQL: GREATEST(popularity - 1, 0)  → 兜在 0，永不为负
+		//   Redis: ZINCRBY -1                   → **可以是负数**
+		//
+		// 为什么 Redis 侧不兜：桶的 score 语义是"近 60 分钟的净互动量"，
+		// 而净互动量**本来就可能是负的**（先赞后取消 = 净 -1）。把它夹到 0
+		// 就丢失了"这条视频最近在掉粉"的信息，而且 ZUNIONSTORE 求和时也不必夹。
+		// 负分视频自然沉到榜尾，不需要额外处理。
+		//
+		// 用户能肉眼看到这个差异：DB popularity 是 0 时，redis-cli 里桶的 score 是 -1。
+		//
+		// 阶段9 注意：这条口径**在 MQ 路径下同样成立** ——
+		// PopularityWorker 直接调同一个 UpdatePopularityCache，
+		// 所以走不走 MQ，桶里的数都长一个样。
+		UpdatePopularityCache(ctx, s.cache, like.VideoID, -1)
+	}
+	return nil
+}
+
+// unlikeMySQLDirect 是阶段4 的取消点赞直写事务，原封不动搬进来。
+// 和 likeMySQLDirect 一样，它是永久降级路径而不是历史遗留。
+func (s *LikeService) unlikeMySQLDirect(ctx context.Context, like *Like) error {
 	return s.repo.Transaction(ctx, func(tx *gorm.DB) error {
 		// ③ 为什么这里不查存在性：取消点赞在"视频已被删"的情况下是**无害**的 ——
 		// 删掉那条流水，两条计数 UPDATE 命中 0 行、不报错也不改任何东西，结果自洽。

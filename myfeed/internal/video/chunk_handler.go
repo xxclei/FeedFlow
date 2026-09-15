@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"myfeed/internal/config"
 	"myfeed/internal/middleware/jwt"
 
 	"github.com/gin-gonic/gin"
@@ -103,10 +104,14 @@ func (st *chunkSessionStore) remove(uploadID string) {
 
 type ChunkUploadHandler struct {
 	store *chunkSessionStore
+	// storage 只用来算落地目录，**和 video_handler 直传必须同源** ——
+	// 分片和直传写的是同一个 `videos/<id>/<date>/`，两边布局不一致的表现是
+	// "分片传上去的视频，发布后门禁探测找不到文件"。见 config/paths.go。
+	storage config.StorageConfig
 }
 
-func NewChunkUploadHandler() *ChunkUploadHandler {
-	return &ChunkUploadHandler{store: newChunkSessionStore()}
+func NewChunkUploadHandler(storage config.StorageConfig) *ChunkUploadHandler {
+	return &ChunkUploadHandler{store: newChunkSessionStore(), storage: storage}
 }
 
 // InitChunkUpload ① 开会话：查断点续传索引 → 有就接着传，没有就新建。
@@ -151,10 +156,10 @@ func (h *ChunkUploadHandler) InitChunkUpload(c *gin.Context) {
 	}
 
 	// 输出路径在 init 就定下来：分片直接按偏移写进最终文件，必须先有归宿。
-	// 目录结构和直传保持一致（videos/<作者ID>/<日期>/），避免单目录塞几十万文件
+	// 目录结构和直传保持一致（videos/<作者ID>/<日期>/），避免单目录塞几十万文件。
+	// 这条一致性由 config.VideosDir 保证 —— 两边都调它，不各自拼字符串。
 	date := time.Now().Format("20060102")
-	relDir := filepath.Join("videos", fmt.Sprintf("%d", accountID), date)
-	absDir := filepath.Join(".run", "uploads", relDir)
+	absDir := h.storage.VideosDir(accountID, date)
 	if err := os.MkdirAll(absDir, 0o755); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create output dir"})
 		return

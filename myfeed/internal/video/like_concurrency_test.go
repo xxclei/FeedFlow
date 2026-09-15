@@ -73,11 +73,37 @@ func setup(t *testing.T) (*gorm.DB, *video.LikeRepository, *video.VideoRepositor
 	t.Cleanup(func() {
 		gormDB.Exec("DELETE FROM likes WHERE video_id = ?", v.ID)
 		gormDB.Exec("DELETE FROM videos WHERE id = ?", v.ID)
+		// 关掉这个测试**自己那个**连接池。
+		//
+		// 不加这一行会发生什么（踩过）：
+		// 每调一次 setup 就 db.NewDB 出一个**新池**，而 NewDB 里
+		// `SetMaxOpenConns(100)` 是**每个池**的上限。这个包的测试
+		// 加起来有 6 个 setup 调用 → 最坏 600 条连接，
+		// 而 MySQL 的 max_connections 是 151。
+		//
+		// 症状极具误导性：**每个测试单独跑都过，一起跑就红**，
+		// 报的错还是 `Error 1040: Too many connections` ——
+		// 看起来像"数据库扛不住了"，实际是测试自己漏了连接。
+		// 而它最先炸的往往是一个跟连接毫无关系的测试
+		// （TestTransactionEscape），于是第一反应会去怀疑那个测试的代码。
+		_ = db.CloseDB(gormDB)
 	})
 
 	likeRepo := video.NewLikeRepository(gormDB)
 	videoRepo := video.NewVideoRepository(gormDB)
-	return gormDB, likeRepo, videoRepo, video.NewLikeService(likeRepo, videoRepo), v.ID
+	// 后三个依赖全传 nil，这个测试**故意**这样：
+	//
+	//	cache=nil        → 不碰 Redis，只验 MySQL 侧
+	//	likeMQ=nil       → 强制走降级路径
+	//	popularityMQ=nil → 同上
+	//
+	// 阶段9 之后，"MQ 全挂"这条降级路径**不是测试专用形态，是生产形态之一**
+	// —— Redis 或 RabbitMQ 任何一个连不上，线上跑的正是这段代码。
+	// 所以这里传 nil 不是"省事"，而是在测一条真实存在的路径。
+	//
+	// 反过来说：这个测试**不覆盖** MQ 路径的并发正确性，那条路径的
+	// 幂等靠 LikeWorker 的 created/deleted 闸门，得在 worker 那边测。
+	return gormDB, likeRepo, videoRepo, video.NewLikeService(likeRepo, videoRepo, nil, nil, nil), v.ID
 }
 
 // runConcurrently 让 n 个 goroutine 在**同一条起跑线**上同时出发。

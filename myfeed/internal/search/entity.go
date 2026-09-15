@@ -67,6 +67,19 @@ const (
 	ModeNgramOr Mode = "ngram-or"
 	// ModeLike 两路都在，但查询词太短（< ngram_token_size），词法退成 LIKE
 	ModeLike Mode = "like"
+	// ModeLikeFallback 两路都在，但**全文索引连一条都没命中**，词法退成 LIKE 兜底。
+	//
+	// 和 ModeLike 分开报，是因为这两种"跑了 LIKE"的排查方向完全不同：
+	//
+	//	ModeLike          查询词太短，索引里根本没有这么短的 token —— **预期行为**，
+	//	                  单字搜索靠的就是它，没什么可修的
+	//	ModeLikeFallback  查询词够长却零命中 —— **索引本身可疑**：
+	//	                  停用词把 n-gram 削掉了、ngram_token_size 被人改过、
+	//	                  或者索引压根没重建
+	//
+	// 换句话说它是"搜视频搜不到"这类 bug 的**仪表盘读数**。这正是 Mode 存在的理由
+	// （见上面那段）：悄悄降级才是问题，降级了还说一声就不是。
+	ModeLikeFallback Mode = "like-fallback"
 	// ModeLexicalOnly 向量那一路不可用（Redis 或 Ollama 挂了 / 没接）
 	ModeLexicalOnly Mode = "lexical-only"
 	// ModeVectorOnly 词法那一路不可用（FULLTEXT 索引没建成功）
