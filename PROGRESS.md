@@ -22,13 +22,33 @@
 | 8 | 热榜 | [08](howto_feed-rebuild/08-热榜.md) | ⬜ 未开始 | 翻页榜单不抖；停 Redis 降级 MySQL |
 | 9 | RabbitMQ 与 Worker | [09](howto_feed-rebuild/09-RabbitMQ与Worker.md) | ⬜ 未开始 | 点赞秒回异步落库；停 MQ 直写兜底 |
 | 10 | Docker 部署 | [10](howto_feed-rebuild/10-Docker部署.md) | ⬜ 未开始 | `docker compose up -d --build` 全部起来 |
-| 11 | 前端总装 | [11](howto_feed-rebuild/11-前端.md) | 🔶 随行完成约 75%（骨架/登录/发布页/分片上传/批量投稿/发现页/标签流/端上分流/播放页/检索页已就绪） | 浏览器完整走一遍用户旅程 |
-| 12 | 私信与 SSE 实时通知 | [12](howto_feed-rebuild/12-私信与SSE实时通知.md) | ⬜ 未开始 | 两个账号互发私信；点赞触发实时通知 |
+| 11 | 前端总装 | [11](howto_feed-rebuild/11-前端.md) | 🔶 随行完成约 90%（骨架/登录/发布页/分片上传/批量投稿/发现页/标签流/端上分流/播放页/检索页/通知中心/私信页已就绪） | 浏览器完整走一遍用户旅程 |
+| 12 | 私信与 SSE 实时通知 | [12](howto_feed-rebuild/12-私信与SSE实时通知.md) | 🔶 代码完成并实测（2026-09-14），**未在真浏览器点过** | 两个账号互发私信；点赞触发实时通知 |
 
 **扩展（不在上面这条路线上）**：模糊检索 —— `FULLTEXT + ngram` 词法那一路，2026-09-13。
 howto 那 13 篇文档一份都没提检索（`grep -rln "FULLTEXT\|ngram" howto_feed-rebuild/*.md` 零命中），
 所以它没有阶段编号，别按"阶段 7"去找它 —— 阶段 7 是 Redis 缓存。
 另一半（向量召回 + RRF 融合 + 回填命令）**明确推迟**，见下面「已知缺口」。验收清单在 §「检索」。
+
+**扩展（不在上面这条路线上）**：视频播放体验 —— QoE 埋点 / 上传质量门禁 / 转码多档 HLS / 过载降级，2026-09-15。
+`grep -rln "ffmpeg\|转码\|码率\|m3u8\|HLS\|画质" howto_feed-rebuild/*.md` **零命中**，
+所以和检索一样没有阶段编号。**完整实测记录在 `myfeed/scripts/bench-notes-transcode.md`**（不写在这里，避免两份会漂移的副本）。
+动因：`bench-notes-video-delivery.md` 测出"撑 33 人"是假的安全感 —— 没有转码时
+码率 100% 由上传者决定，128/135 条素材是 1080p 却只有 0.16~1.16 Mbps，分辨率与码率是**脱钩**的。
+进度：
+
+| 段 | 内容 | 状态 |
+|---|---|---|
+| A | QoE 埋点（`internal/qoe/` + `useQoE.ts`） | 🔶 代码完成，**基线未采**（见下） |
+| B | 上传质量门禁（`mp4probe.go` 读 moov，超阈值入队） | ✅ 实测通过 |
+| C | 转码 worker + 多档 HLS（1080p/720p/480p，runID 布局） | ✅ 实测通过 |
+| D | 播放端 hls.js + ABR（动态 import，按播放才构造） | 🔶 请求链实测通过，**未在真浏览器点过** |
+| E | 过载降级（并发码率核算 + 动态 master + 503） | ⬜ 未开始 |
+
+⚠ 三件**已知未完成**（都在 `bench-notes-transcode.md` §七里写了细节）：
+① `bench-notes-qoe.md` §4.3 要求的 QoE 基线错过了采集时机（必须在 `r.Static` → `mountStatic` 替换**之前**采）；
+② 阶段 D 缺"真浏览器能播、真的切档"这一次验收；
+③ 阶段 E 开工前要先定 `BANDWIDTH` 的口径（实测峰值段最坏是声明值的 110%，负载核算不能直接用声明值）。
 
 ## 前端随行记录（DESIGN.md 风格）
 
@@ -50,7 +70,10 @@ howto 那 13 篇文档一份都没提检索（`grep -rln "FULLTEXT\|ngram" howto
 - ✅ **检索页 `/search?q=`（本轮扩展）**：`FULLTEXT + ngram` 词法搜索 + `mode`/`arms` 进调试面板
 - ✅ **批量删除（本轮）**：「我的作品」多选 + 全选 + 批量条，`skipped_ids` 如实提示
 - ✅ **批量标签（本轮）**：`TagChipsInput` chip 编辑器，三个批量选项改成**发布那一刻才求值**
-- ⬜ 阶段7+：三级缓存 / 热榜页 / SSE 实时通知
+- ✅ **通知中心（阶段12）**：`NotificationBell` 顶栏铃铛 + 下拉面板（两壳共用）、红点未读数、点通知按 type 分流跳转（follow→主页，其余→视频）
+- ✅ **私信页 `/messages`（阶段12）**：联系人 = 关注 ∪ 粉丝（去重去掉自己）；两栏布局；发完追加返回的 Message 不重拉
+- ✅ **SSE 长连接（阶段12）**：挂在 `App.vue` 而不是铃铛组件里（壳会随断点重挂载）；token 走 `?token=`（EventSource 发不了 header）；`readyState===CLOSED` 才重建（`CONNECTING` 是浏览器自己在退避，绝不能 close）
+- ⬜ 阶段7+：热榜页（三级缓存的**前端**页面还没做；后端阶段7/8/9 已完成）
 
 ### 批量上传踩到的三个后端行为（都已在代码里标注）
 
@@ -187,6 +210,156 @@ offset 分页在一般情况下不安全（新插入会让翻页重复/遗漏）
 
 **验收（你自己跑，见 §「验收命令」）**：`npx vue-tsc -b && npx vite build` 已过（tsc 与 build 都干净）；
 `go build ./...` / `go vet ./...` / `gofmt` 已过（唯一例外见「已知缺口」）。
+
+### 检索搜不到东西：ngram 索引被 OPTIMIZE 重新投毒（2026-09-15 修）
+
+**症状**：搜 `java` / `Java` / `JAVA` 全部 0 条，而库里 103 条的标题就以 `java-redis…` 开头；
+搜 `redis` 正常。前端显示"没有找到相关视频"——**没有任何报错、日志、异常**。
+
+**根因（三层，每层都会单独让人查不出来）**
+
+**(1) 索引里没有含字母 `a` 或 `i` 的 bigram。**
+`ngram_token_size=2` 时每个 token 都是 bigram，而 InnoDB 默认停用词表里
+**有单字母 `a` 和 `i`**（另有 14 个两字词 `an/as/at/be/by/de/en/in/is/it/of/on/or/to`）。
+ngram 的"含停用词"判定是**子串**判定 —— 于是含 `a` / `i` 的 bigram 整条被丢掉：
+
+```
+"java"   → ja / av / va          三个全含 a，**全丢** → 一个字都搜不到
+"banana" → 同理，全丢
+"redis"  → re ✓ / ed ✓ / di（含 i）✗ / is（本身是停用词）✗ → 还剩两个，能搜到
+```
+
+所以"java 搜不到、redis 搜得到"不是巧合也不是数据问题，是这条规则。
+实测确认（隔离探针表，逐一验过）：`ab de di is iq ja av va ad` 全 0，
+`bc cd ef gh yz re ed qj jv` 全命中；把 `innodb_ft_enable_stopword` 关掉之后**全部命中**。
+
+**(2) 建索引时关了停用词，但紧接着被 `OPTIMIZE TABLE` 开着停用词重建了一遍。**
+`search_index.go` 一直有 `SET SESSION innodb_ft_enable_stopword = OFF`，写对了；
+问题是它和 `OPTIMIZE TABLE videos` **不在同一条连接上**——
+`db.Exec` 从池里拿到的是默认 `ON` 的连接。而 InnoDB 的 `OPTIMIZE TABLE`
+是 `ALTER TABLE … FORCE` 的映射，**整表重建、包含全文索引**，重建时按**当前会话**的设置切词。
+MySQL 自己会说这句：`Table does not support optimize, doing recreate + analyze instead`。
+**即"建好"之后被"重建成坏的"**，`SET SESSION` 那一行等于没写。
+
+复现（两段 SQL 就是那两次调用，第二段用新连接）：
+```sql
+-- 连接 A：停用词 OFF 建索引 → java=1 di=1 banana=1 ✓
+-- 连接 B（默认 ON）：OPTIMIZE TABLE → java=0 di=0 banana=0，redis=1 ✗
+```
+
+**(3) 索引一旦建错就永久错下去。** `EnsureFulltextIndex` 当时只做"不存在才建"，
+索引存在就直接 `return nil`，只打一句"解析器未能自动校验，请人工确认一次"——
+而**没有人会去人工确认**，所以这句警告在启动日志里躺了很久。
+
+**(4) 最后一公里：零命中被当成"库里没有"。** `LexicalSearcher.Search` 只有
+AND→OR 两档，两档都空就返回空列表，前端显示"没有找到相关视频"。
+空集的语义是"没有这个视频"，而真实原因是"检索不可信"——两者长得一模一样。
+
+**修法（对应上面四层）**
+
+1. **把写索引内容的三步钉在同一条连接上**：`SET … OFF` / `DROP+ADD` / `OPTIMIZE`
+   全塞进同一个 `db.Connection` 闭包，恢复会话变量用 `defer`（中间任何一步 return 都不会跳过它）。
+   教训不是"OPTIMIZE 有毒"，而是**凡是要写索引内容的步骤都必须和关停用词在同一条连接**。
+2. **让索引自己记着配方**：`ALTER TABLE … WITH PARSER ngram COMMENT 'myfeed-ft:ngram-n2-sw0'`，
+   启动时读 `information_schema.STATISTICS.INDEX_COMMENT` 和当前应有的配方比，
+   **不一致就重建**（`DROP + ADD` 合成一条 ALTER，一次表重建）。
+   配方里带 `ngram_token_size`，因为它是全局变量，改了不会报错、只会让已有索引搜不出东西。
+   ——判据跟着变量走，不靠任何人的记性。
+3. **给 LIKE 补第三档**：AND → OR → **LIKE 兜底**，报新 mode `like-fallback`。
+   走到那一档说明"索引连一条都没命中"，而 LIKE 不看索引，是唯一还能给出正确答案的手段。
+   按 token AND 而不是整串 LIKE（`java 教程` 要能命中 `java-…教程`）。
+
+**验收数字**（本机，`videos` 103 条含 java）
+
+| | 修前 | 修后 |
+|---|---|---|
+| `MATCH … AGAINST('java')` | **0** | **103** |
+| `MATCH … AGAINST('di')` | **0** | **104** |
+| `MATCH … AGAINST('redis')` | 103 | 104 |
+| `POST /feed/search {"query":"java"}` | 0 条 | 50 条（lexical 召回深度） |
+| 启动日志 | "已存在，跳过创建" | 配方不符 → **自动重建** |
+| 索引 COMMENT | 空 | `myfeed-ft:ngram-n2-sw0` |
+
+兜底那一档单独验过：故意用"停用词 ON + 写上正确指纹"制造一个**指纹看不出来**的坏索引，
+搜索仍然返回 50 条，日志打 `全文索引零命中，LIKE 兜底救回 50 条 —— 索引可疑`。
+
+> **两条并列的教训**
+> ① `SET GLOBAL innodb_ft_enable_stopword = 0` **不影响当前会话** —— 用它验证会得到
+> "改了也没用"的假结论（本轮我自己先踩了一次，白查了一轮）。
+> ② 指纹只能保证"没被建错"，保证不了"没被建坏"。所以第 3 条兜底不是重复劳动。
+
+**顺带发现的两个既有问题（未修，见「已知缺口」）**
+
+- **`mode` 现在恒为 `lexical-only`**，`ngram` / `ngram-or` / `like` / `like-fallback`
+  一个都不会出现在前端调试面板上 —— `service.go` 那段 switch 在 `runVec=false` 时
+  直接给 `lexical-only` 并**丢掉词法那一路自己的形态**（本轮向量那一路没接线，所以恒为 false）。
+  要修得给 `Result` 加字段，并且 `Mode` 会被冻结进游标，不是一行的事。
+- **`go test ./internal/video/...` 会动真库**：`like_concurrency_test.go` 读
+  `configs/config.yaml` 连**开发库**并跑 `db.AutoMigrate` —— 而 `AutoMigrate` 会调
+  `EnsureFulltextIndex`，所以**跑一次单测就可能 DROP+ADD 全文索引并 OPTIMIZE 整张 videos 表**。
+  本轮索引其实是被 `go test` 先修好的（API 启动日志因此显示"已就绪"）。
+
+### 前端：手动清晰度选择 + QoE 看板（2026-09-15，本轮扩展）
+
+两件都是**纯前端**，后端一行没改。属于 `QoE 埋点` 那块扩展的前置件。
+
+**① 播放器的手动清晰度选择**（`components/player/VideoPlayer.vue`）
+
+档位来自 hls.js 的 `MANIFEST_PARSED`。四个决定值得写下来，因为都很容易写反：
+
+| 决定 | 理由 |
+|---|---|
+| 高亮跟 `pickedLevel`（用户意愿），**不跟当前实际档位** | 自动模式下 ABR 一直切档，跟着实际档位会让「自动」那颗按钮一闪一闪，而且用户点完「自动」立刻又跳走，看起来像没点上 |
+| 用 `nextLevel` 而不是看起来最"跟手"的 `currentLevel` | `currentLevel` 会 **flush 当前缓冲区**去尽快换档，每次造成一次真实的重缓冲 —— 而 `useQoE.ts` 把 `waiting` 记成 `stall_count`，**用户每点一次清晰度，看板上的卡顿率就自己涨一点**。一个用来判断"服务端改动有没有让播放变差"的指标不能掺进这种自伤。`nextLevel` 不打断播放，代价是生效点在下一个分片边界（本项目 6 秒）—— 按钮高亮仍立刻变，只是画面慢一拍 |
+| 档位名**优先用 `height`**（`1080p`），拿不到才退到码率 | hls.js 的 `level.name` 来自 master 里的 `NAME`，而本项目的 master 是**服务端现场生成的**（阶段 E 降级时只发低档），name 可能为空或几档写同一个。`height` 是它从 `RESOLUTION` 解析出来的数字 |
+| 渲染判据是 `levels.length >= 2`，**不是 `> 0`** | 阶段 E 的降级是服务端把 master 缩成一档 —— 那时"选"没有意义，正确的表现是**整排按钮消失**，而不是显示一排只能点一个的按钮（后者会让人以为"只有低清"，其实是服务端在降级） |
+
+选择器**按了播放之后才出现**（`levels` 只有解析完 master 才有内容）。这是"延迟构造 hls.js"
+那个决定的连带结果，没有为它破例：想提前知道有哪几档就得先拉一次 master，
+那等于把刚省掉的那次请求原样加回来。
+
+**② QoE 看板**（新 `views/QoeStatsView.vue` + 路由 `/qoe`）
+
+先说一句背景：`api/qoe.ts` 里的 `getQoEStats` / `QoEStats` **早就写好了，但全项目没有调用方** ——
+缺的从来只有 UI，不是接口。
+
+- **路由刻意不加 `requiresAuth`** —— 判据是"跟后端接口的鉴权级别走"：`/qoe/stats` 挂的是
+  SoftJWTAuth，且只返回聚合分布、不含用户维度（后端 `qoe/handler.go` 有专段讲这条边界）。
+  注意入口在 `/home`（要登录）而这一页本身不要，这不是矛盾，是"链接放哪"和"页面要什么权限"两件事。
+- **条件走 URL query**（`?v=视频ID&d=天数`）：这一页的主要用途是"改动前后各看一次"，
+  条件得能收藏、能分享 —— 阶段 E 要对比的「降级开 vs 关」就是同一串 query 换个 `d`。
+- **⚠ `days=0` 不能用来表示"全部时间"**：后端把 `0` 解释成"用默认值 7 天"
+  （Go 零值既表示"没传"也表示"我就要 0"，那边选了"零值即默认"）。
+  所以全部时间只能传**负数**（前端用 `-1`）。任何想表达"不限时间"的地方传了 0，
+  都是一个**静默的 7 天**，看板上完全看不出来。
+- **两个卡顿率口径并列显示，不合成一个数**：会话口径（`stalled_sessions / total`）
+  和时长口径（`stall_ratio`）会被读成"卡顿率"，但它们不一致时指向完全相反的两件事 ——
+  前者高后者低 = 很多次很短的卡顿；前者低后者高 = 少数几次很长的卡顿（这些人大概率直接流失了）。
+  合成一个数就把这个区别抹掉了，所以页面上专门留了一段解释这件事。
+- **字段名 `tiers` 是误导的**：它装的其实是**码率分桶**（`<500 / 500~1500 / 1500~3000 / 3000+ kbps`），
+  不是档位名。客户端没有上报"这是 1080p 还是 720p"，所以看板只能到分桶这一层 —— 页面上标明了。
+
+**验收（真实数据，不是构造的）**
+
+| | 结果 |
+|---|---|
+| `POST /qoe/stats` | 通。7 次会话 / 1 游客 / 2 次会话卡过 / `stall_ratio` 2.70% |
+| 首帧 | p50 **1437 ms**、p95 / p99 均 **9003 ms**（n=7） |
+| 码率 | 均值 4585 kbps，3 个 HLS 会话全落在 `3000+` 桶 |
+| 切档 | 累计 0 次 |
+| `npm run build` | 过。`QoeStatsView` 独立 chunk 6.97 kB |
+| 动态 import | 仍然成立：`hls.js` 独立 chunk **574.74 kB**，`VideoDetailView` 仍 22.92 kB |
+
+> 两组数字自己说明了两件事，都不用额外论证：
+> ① **会话口径 28.6%（2/7）对时长口径 2.70%** —— 正是上面说的"很多次很短的卡顿"那一档，
+> 页面上那段解释立刻有了实例。
+> ② **p95 = p99 = 9003 ms** —— n=7 时分位数退化成最大值，所以这是**一次**很慢的首帧在拉高整列，
+> 不是"普遍 9 秒"。样本太少，不下结论。（9003 ms 这个量级更像 hls.js 那个 574 kB chunk
+> 的冷启动，而不是网络 —— 但那也只是个待验的猜测。）
+
+**边界（必须一起看）**：这里只能证明**接口通、数字解析正确、代码编得过**。
+**没有在浏览器里真正打开过这两页** —— 我没法开浏览器，所以选择器的交互、
+看板的排版都还是"未目视确认"状态。这一步得你点一下。
 
 ### 播放页 `/video/:id`（2026-09-13）
 
@@ -541,6 +714,8 @@ handler 原样搬进库（`video_handler.go:55`），只在 service 里 `TrimSpa
 | 5 | 检索索引**没有 `*` 通配符** | 计划里就写了先不加：ngram 已把词切成 bigram，`*` 与 ngram 的交互是版本相关的，且有"搜索词是句末字符时 `*` 失效"的报告。先用裸 `+token`，实测漏检再加 |
 | 6 | **删除视频不清磁盘文件**（`.run/uploads` 下的 `.mp4` 和封面 `.jpg` 全留着）。全项目唯一的 `os.Remove` 在 `chunk_handler.go:203`，那是**放弃的分片会话的 `.part`**，和删除无关 | 见下面 §「为什么删视频不删文件」。**不是漏了，是不该随手做**：① 一个文件可能被多条视频行共用；② `play_url` 是**客户端给的**，服务端没有归属凭证；③ MySQL 事务和文件系统之间没有原子性。要做得先解决 ①②，然后按"磁盘上有、`videos` 表无引用"做**异步 GC** |
 | 7 | **删除只对 `videos` + `video_tags` 负责**：`likes` / `comments` / `outbox_msgs` 里指向已删视频的行会留下变孤儿 | `video_repo.go:55` 上面那段注释已经自认。`likes` 侧侥幸无害（`/like/listMyLikedVideos` 走 `GetByIDs`，孤儿查不到自然消失），但 `comments` 将来的评论数统计、阶段9 Poller 给已删视频发事件是实实在在的。**和 #6 一起做，方案见下面 §「删除的完整清理 + 文件 GC」** |
+| 8 | **`mode` 恒为 `lexical-only`**，`ngram` / `ngram-or` / `like` / `like-fallback` 一个都不会出现在前端调试面板上 | `service.go` 那段 switch 在 `runVec=false` 时直接给 `lexical-only`，**丢掉词法那一路自己的形态**；而本轮向量那一路没接线，`runVec` 恒为 false。代价是"搜索为什么搜不到"少了一个现成读数（2026-09-15 那个 bug 要是能一眼看到 `like-fallback` 会好查得多）。要修得给 `Result` 加一个 `lexical_mode` 字段（别改 `mode` 的语义，`mode` 回答的是"哪几路跑了"，两个维度正交），并且 **`Mode` 会被冻结进游标**，`cursor.go` 要一起改。见 §「检索搜不到东西」 |
+| 9 | **`go test ./internal/video/...` 会动真库** | `like_concurrency_test.go` 读 `configs/config.yaml` 连**开发库**并跑 `db.AutoMigrate`，而 `AutoMigrate` 会调 `EnsureFulltextIndex` —— 所以**跑一次单测就可能 `DROP`+`ADD` 全文索引、并 `OPTIMIZE` 整张 `videos` 表**（2026-09-15 那次索引其实是被 `go test` 先修好的，API 启动日志因此显示"已就绪"）。测试打真库本身是既有设计（它测的是真实并发下的行锁行为，mock 掉就没意义了），但现在它带着 DDL 副作用。要么给测试一个独立库（改 DSN），要么让 `AutoMigrate` 的建索引那一步可跳过 |
 
 > **本条原先写的"做干净要跨模块（`like`/`comment` 各暴露一个 `DeleteByVideoIDs`）"是错的，已删。**
 > `internal/video/` 下 17 个文件**全是 `package video`**，like / comment / tag / outbox 同包 ——

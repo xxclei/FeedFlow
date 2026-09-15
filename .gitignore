@@ -13,6 +13,16 @@ dist/
 *.pid
 *.log
 
+# 部署用的源码压缩包（本机打包 → 上传服务器用，属于构建产物）
+# 它每次打包内容都会变，进仓库只会制造无意义的 diff。
+# 另外它虽然**排除了** deploy/.env 和 configs/config.prod.yaml（打包时验证过），
+# 但那种"安全性靠一条 tar 命令的参数保证"的东西，最好的处理是根本不进版本库。
+myfeed-src.tar.gz
+*.tar.gz
+
+# Python 缓存（scripts/ 下的压测脚本会生成）
+__pycache__/
+
 # IDE / OS
 .idea/
 .vscode/
