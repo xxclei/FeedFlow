@@ -1,0 +1,46 @@
+# 开发环境配置模板。
+#
+# 用法：复制成同目录下的 config.yaml 再改。
+#
+#     cp configs/config.example.yaml configs/config.yaml
+#
+# config.yaml 被 .gitignore 排除（它里面有真密码），这份模板**要进仓库** ——
+# 别人 clone 下来得知道要配什么。
+#
+# 里面的 host / port 默认值对应 deploy/docker-compose.deps.yml 起的那三个容器：
+# MySQL 映射到宿主机 3307（容器内是 3306）、Redis 6379、RabbitMQ 5672 + 管理台 15672。
+# 三个 password 填成那个 compose 文件里给对应容器设的值即可。
+#
+# 生产配置模板见 config.prod.example.yaml —— 那一份的差别不只是密码：
+# host 从 127.0.0.1 改成容器名 mysql / redis / rabbitmq，且**必须**设 JWT_SECRET 环境变量。
+
+server:
+  port: 8080
+
+database:
+  host: 127.0.0.1
+  port: 3307                # 宿主机映射端口；容器之间通信要用 3306
+  user: root
+  password: "change-me"     # ← 与 docker-compose.deps.yml 的 MYSQL_ROOT_PASSWORD 一致
+  dbname: myfeed
+
+redis:
+  host: 127.0.0.1
+  port: 6379
+  password: "change-me"     # ← 与 docker-compose.deps.yml 的 --requirepass 一致
+  db: 0
+
+rabbitmq:
+  host: 127.0.0.1
+  port: 5672
+  username: admin
+  password: change-me       # ← 与 docker-compose.deps.yml 的 RABBITMQ_DEFAULT_PASS 一致
+
+# 检索参数。整段不写也能跑（search/entity.go 的 withDefaults 兜底）。
+#
+# 向量那一路（Ollama + Redis Stack + 回填命令）本轮先跳过，
+# 所以这里**没有** ollama 段、也没有 dim / max_distance —— 那两个参数
+# 目前没有任何读者，写在配置里就是假旋钮（改了没反应，比缺参数更费时间）。
+search:
+  depth: 50              # 召回条数（融合前的候选池，和每页 limit 是两件事）
+  rrf_k: 60              # RRF 的 k（Cormack 2009 的经验值）；单路时不影响排序

@@ -19,6 +19,10 @@ cmd/cmd
 configs/config.prod.yaml
 deploy/.env
 
+# 开发配置。密码是 localhost 的，本来不算密钥，但仓库转公开后
+# 让密码字面量出现在首页 diff 里观感不好 —— 模板在 config.example.yaml。
+configs/config.yaml
+
 # IDE / OS
 .idea/
 .vscode/
