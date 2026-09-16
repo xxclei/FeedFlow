@@ -48,7 +48,7 @@
 
 ### 技术栈
 
-**后端**：Go 1.25 · Gin · GORM · MySQL 8（`FULLTEXT + ngram`）· Redis 7 · RabbitMQ（topic + 死信）· ffmpeg
+**后端**：Go 1.26 · Gin · GORM · MySQL 8（`FULLTEXT + ngram`）· Redis 7 · RabbitMQ（topic + 死信）· ffmpeg
 **前端**：Vue 3 · TypeScript · Vite · Pinia · hls.js · SparkMD5
 **部署**：Docker 多阶段构建 · Docker Compose · nginx
 
